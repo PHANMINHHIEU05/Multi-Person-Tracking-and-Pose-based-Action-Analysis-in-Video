@@ -8,11 +8,11 @@ tqdm==4.66.2
 ultralytics==8.1.29
 
 # ===== Tracking (ByteTrack deps – cần C++ Build Tools) =====
-lap==0.4.0
+lapx==0.9.4
 cython_bbox==0.1.5
 
 # ===== Pose Estimation =====
-mediapipe==0.10.9
+mediapipe==0.10.32
 
 # ===== Machine Learning =====
 scikit-learn==1.4.1.post1
