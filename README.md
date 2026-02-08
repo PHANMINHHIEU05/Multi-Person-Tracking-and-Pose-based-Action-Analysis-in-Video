@@ -1,31 +1,119 @@
-# Multi-Person-Tracking-and-Pose-based-Action-Analysis-in-Video
+Multi-Object Tracking & Real-Time Behavior Analysis System
 
-Giai đoạn 1: Detect & Track (Nhìn và Nhớ)
+1. Project Overview
 
-    Công nghệ: YOLOv8 (Detector) + ByteTrack (Tracker).
+This project implements a real-time multi-object human monitoring system designed to not only detect people in a video stream, but also maintain consistent identities (IDs) over time and provide a foundation for higher-level behavior analysis.
 
-    Thuật toán: Kalman Filter (Dự đoán vị trí) & Hungarian Algorithm (Khớp ID).
+The system is built as a multi-stage computer vision pipeline, combining modern deep learning models with classical state estimation techniques.
+In the current stage, the project focuses on robust multi-object tracking under resource-constrained environments (CPU-only systems), ensuring system stability and reproducibility.
 
-    Kết quả: Mỗi người trong video được bao quanh bởi một Bounding Box và có một con số ID duy nhất không đổi suốt video.
+Core objectives:
 
-Giai đoạn 2: Pose Extraction (Trích xuất khung xương)
+Detect humans in video streams using a state-of-the-art object detector.
 
-    Công nghệ: MediaPipe Pose.
+Track multiple individuals simultaneously while maintaining stable IDs.
 
-    Cách làm: Với mỗi ID người, hệ thống crop ảnh của riêng người đó và chạy model MediaPipe để lấy ra 33 điểm khớp xương (Keypoints) dưới dạng tọa độ (x,y,z).
+Handle partial occlusions and crossings between individuals.
 
-    Kết quả: Một bộ khung xương kỹ thuật số mô phỏng tư thế của từng ID.
+Operate in near real-time on systems without dedicated GPU hardware.
 
-Giai đoạn 3: Action Classification (Hiểu hành vi)
+2. System Architecture (High-Level Pipeline)
 
-    Công nghệ: Machine Learning (Random Forest hoặc SVM).
+The system follows a modular pipeline design:
 
-    Thuật toán: Feature Engineering (Tính góc khớp xương, vận tốc di chuyển, tỉ lệ chiều cao cơ thể).
+Object Detection
+Human detection is performed using YOLOv8 (Ultralytics), configured to detect only the person class for efficiency.
 
-    Kết quả: Chuyển đổi tọa độ khớp xương thành nhãn hành động: "Standing", "Walking", "Sitting".
+Multi-Object Tracking
+Detected bounding boxes are passed to ByteTrack, which integrates Kalman Filter-based motion prediction to maintain consistent identities across frames, even during short-term occlusions or missed detections.
 
-Giai đoạn 4: Data Analytics (Thống kê & Dashboard)
+Visualization & Monitoring
+Each tracked individual is rendered with a bounding box and a unique ID in the output video stream, allowing real-time inspection of tracking stability.
 
-    Công nghệ: Python (Pandas), OpenCV (Overlay).
+Pose estimation and behavior classification are intentionally excluded in this phase to isolate and validate the tracking backbone.
 
-    Kết quả: Vẽ nhãn hành động đè lên video thời gian thực và xuất file báo cáo cuối cùng (ví dụ: ID_01 đã ngồi 70% thời gian).
+3. Computational Constraints & Design Assumptions
+
+This project is designed to run on laptop-class machines without GPU acceleration.
+To prevent hardware overload and ensure stable execution, the following constraints and design choices are enforced:
+
+Hardware Assumptions
+
+CPU-only execution (no CUDA / GPU acceleration)
+
+Consumer-grade laptop hardware
+
+Limited thermal headroom
+
+Enforced System Constraints
+
+Input resolution: downscaled to 640×360 or 854×480
+
+Model size: lightweight detector (yolov8n)
+
+Target processing rate: 10–15 FPS
+
+Maximum tracked objects: ≤ 5 persons
+
+Video duration for demo/testing: 30–60 seconds
+
+Performance Optimization Strategies
+
+Frame skipping: detection is performed every N frames, with intermediate frames handled via Kalman Filter prediction.
+
+Class filtering: only the person class is processed.
+
+Confidence thresholding: low-confidence detections are discarded to reduce tracker load.
+
+Minimal visualization overhead: only bounding boxes and IDs are rendered.
+
+These constraints allow the system to remain responsive while avoiding sustained high CPU load or thermal stress.
+
+4. Dataset & Input Videos
+
+The system operates on publicly available video sources intended for academic and research use, including:
+
+Stock videos featuring pedestrian movement in indoor or semi-controlled environments.
+
+Public surveillance-style footage with fixed camera viewpoints.
+
+Benchmark datasets commonly used in multi-object tracking research.
+
+All input videos are preprocessed (resolution and duration) prior to inference to ensure compatibility with CPU-only execution.
+
+5. Project Scope (Current Stage)
+   Included:
+
+Human detection
+
+Multi-object tracking with stable identity assignment
+
+Real-time visualization
+
+Performance evaluation under resource constraints
+
+Explicitly Excluded (Future Work):
+
+Pose estimation
+
+Action / behavior classification
+
+Statistical behavior analytics
+
+GPU acceleration
+
+This staged development approach ensures a solid and verifiable tracking backbone before introducing higher-level semantic analysis.
+
+6. Reproducibility & Stability
+
+The project emphasizes:
+
+Modular code structure
+
+Explicit dependency management
+
+Conservative runtime configuration
+
+Hardware-aware optimization
+
+These principles ensure that the system can be reproduced and demonstrated reliably across different CPU-only environments.
