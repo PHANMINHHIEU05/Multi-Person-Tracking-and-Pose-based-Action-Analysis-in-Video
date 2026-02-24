@@ -1,0 +1,32 @@
+# ============================================================
+# detect.yaml – Default configuration for Module A (Detection)
+# Override any value via CLI arguments.
+# ============================================================
+
+# Input / Output
+video:   ""                       # Path to input video (required)
+out:     "runs/detect/run1"       # Output directory
+
+# Model
+model:   "yolov8n.pt"             # yolov8n.pt | yolov8s.pt | yolov8m.pt
+device:  "auto"                   # auto | cpu | 0
+
+# Inference settings
+imgsz:   640                      # Inference image size (px)
+conf:    0.35                     # Confidence threshold
+iou:     0.5                      # IoU threshold for NMS
+
+# Frame processing
+stride:  1                        # Process every Nth frame (1 = all)
+resize:  ""                       # Optional resize before inference, e.g. "1280x720"
+
+# Output options
+preview:    false                 # Show live preview (requires display)
+save_csv:   true                  # Save detections.csv
+save_jsonl: false                 # Save detections.jsonl instead of CSV
+
+# ── Outputs produced ──────────────────────────────────────────
+# runs/detect/<run_name>/
+#   video_detect.mp4      – annotated video
+#   detections.csv        – per-frame bounding boxes + conf
+#   meta.json             – run settings and statistics
