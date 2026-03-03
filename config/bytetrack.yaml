@@ -1,0 +1,28 @@
+# ============================================================
+# bytetrack.yaml – ByteTrack tracker configuration
+# Used by Module B (module_b_track.py) via Ultralytics YOLO.
+#
+# Reference: ultralytics/cfg/trackers/bytetrack.yaml (v8.4.x)
+# Pass via: --tracker bytetrack  (resolves to this file automatically)
+# Or:       --tracker config/bytetrack.yaml
+# ============================================================
+
+tracker_type: bytetrack # Tracker backend: botsort | bytetrack
+
+# ── Detection matching thresholds ───────────────────────────
+track_high_thresh: 0.5 # 1st-stage match threshold (high-confidence dets)
+track_low_thresh: 0.1 # 2nd-stage threshold (rescue low-score dets)
+new_track_thresh: 0.6 # Min conf to initialise a new track
+
+# ── Track lifecycle ─────────────────────────────────────────
+track_buffer: 30 # Frames to keep a lost track alive (≈1 s @ 30 fps)
+match_thresh: 0.8 # IoU match threshold between detections and tracks
+
+# ── Score fusion ────────────────────────────────────────────
+fuse_score: True # Fuse detection conf into final track score
+
+
+# ── Notes ───────────────────────────────────────────────────
+# ByteTrack is lightweight and fast.
+# Recommended for non-crowded scenes or when speed is paramount.
+# For crowded scenes with frequent occlusions prefer botsort.yaml.

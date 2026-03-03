@@ -1,0 +1,59 @@
+# ============================================================
+# botsort_custom.yaml – Tuned BoT-SORT config for Module B Enhanced
+# Target scene: ~20 people in 720p video
+# Goal: reduce ID switches during crossings / short occlusions
+#
+# Reference: ultralytics/cfg/trackers/botsort.yaml (v8.4.x)
+# Pass via: --tracker config/botsort_custom.yaml
+# ============================================================
+
+tracker_type: botsort # Tracker backend: botsort | bytetrack
+
+# ── Detection matching thresholds ───────────────────────────
+# Lower track_high_thresh (vs 0.6) to avoid dropping people in crowd.
+# new_track_thresh slightly above track_high_thresh to keep clean initialiser.
+track_high_thresh: 0.45 # 1st-stage high-conf detection match gate
+track_low_thresh: 0.1 # 2nd-stage low-conf rescue gate (keep low)
+new_track_thresh: 0.7 # Min conf to start a brand-new track (higher = fewer spurious IDs)
+
+# ── Track lifecycle ─────────────────────────────────────────
+# 180 frames ≈ 6 s @ 30 fps.  This is the primary knob for surviving occlusions:
+# BoT-SORT keeps a "lost" track alive internally for this many frames before
+# declaring it dead and issuing a NEW id on re-detection.
+# Set very high so the built-in tracker itself can recover people who
+# temporarily leave the frame and return within ~6 seconds.
+track_buffer: 180 # Frames to keep a lost track alive in buffer
+
+# ── Bipartite assignment ─────────────────────────────────────
+# Higher match_thresh (0.8) = less aggressive reassignment = fewer ID jumps.
+# BoT-SORT uses IoU-distance; 0.8 means we accept matches up to IoU-dist 0.8.
+match_thresh: 0.8
+
+# ── Score fusion ────────────────────────────────────────────
+# Multiply IoU distance by detection confidence → better separation in crowd.
+fuse_score: True
+
+# ── Global Motion Compensation (GMC) ────────────────────────
+# sparseOptFlow: fast, good for crowd on fixed or slowly-panning cameras.
+# Use "none" only for completely static camera with no blur.
+gmc_method: sparseOptFlow
+
+# ── ReID appearance matching ─────────────────────────────────
+# Disabled by default to keep pipeline lightweight.
+# Enable only if long-occlusion re-identification is needed and a ReID
+# model is available.  When enabled, tune proximity/appearance thresholds.
+proximity_thresh: 0.5 # Min IoU for ReID candidate consideration
+appearance_thresh: 0.75 # Min cosine similarity for appearance match
+with_reid: False # Set True + set model: path/to/reid.pt to enable
+model: auto # ReID model; "auto" uses YOLO feature extractor
+
+
+# ── Notes ───────────────────────────────────────────────────
+# Key changes vs. default botsort.yaml:
+#   track_buffer 30 → 60   (2x longer "zombie" period)
+#   appearance_thresh 0.80 → 0.75  (slightly more lenient for crowded scenes)
+#   All other parameters kept at conservative defaults.
+#
+# Additional ID stability is provided by module_b_botsort.py post-processing:
+#   - Motion gating  (reject impossible centroid jumps between frames)
+#   - Short-gap stitching (merge new ID into old if same person reappears)

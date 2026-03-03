@@ -1,0 +1,39 @@
+# ============================================================
+# botsort.yaml – BoT-SORT tracker configuration
+# Used by Module B (module_b_track.py) via Ultralytics YOLO.
+#
+# Reference: ultralytics/cfg/trackers/botsort.yaml (v8.4.x)
+# Pass via: --tracker botsort  (resolves to this file automatically)
+# Or:       --tracker config/botsort.yaml
+# ============================================================
+
+tracker_type: botsort # Tracker backend: botsort | bytetrack
+
+# ── Detection matching thresholds ───────────────────────────
+track_high_thresh: 0.5 # 1st-stage match threshold (high-confidence dets)
+track_low_thresh: 0.1 # 2nd-stage threshold (rescue low-score dets)
+new_track_thresh: 0.6 # Min conf to initialise a new track
+
+# ── Track lifecycle ─────────────────────────────────────────
+track_buffer: 30 # Frames to keep a lost track alive (≈1 s @ 30 fps)
+match_thresh: 0.8 # IoU/cost threshold for bipartite assignment
+
+# ── Score fusion ────────────────────────────────────────────
+fuse_score: True # Fuse detection conf into matching score
+
+# ── Global Motion Compensation (GMC) ────────────────────────
+# Helps stable tracking on moving cameras.
+# Options: sparseOptFlow | orb | sift | ecc | none
+# Use "none" or leave as sparseOptFlow for fixed cameras.
+gmc_method: sparseOptFlow
+
+# ── ReID appearance matching ─────────────────────────────────
+proximity_thresh: 0.5 # Min IoU to consider tracks proximate for ReID
+appearance_thresh: 0.8 # Min appearance similarity for ReID matching
+with_reid: False # Enable ReID model (needs extra model + compute)
+model: auto # ReID model path; "auto" uses detector features
+
+
+# ── Notes ───────────────────────────────────────────────────
+# BoT-SORT is preferred for crowded multi-person scenes.
+# Set with_reid: True + a ReID model for improved long-occlusion re-association.
