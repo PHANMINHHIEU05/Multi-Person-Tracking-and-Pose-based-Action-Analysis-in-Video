@@ -52,7 +52,9 @@ coverage.xml
 # Translations
 *.mo
 *.pot
-
+.aidlc-rule-details/
+.copilot/
+aidlc-docs/
 # Django stuff:
 *.log
 local_settings.py

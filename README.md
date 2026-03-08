@@ -1,119 +1,139 @@
-Multi-Object Tracking & Real-Time Behavior Analysis System
+# Multi-Person Tracking & Pose-based Action Analysis
 
-1. Project Overview
+## 1. Project Overview
 
-This project implements a real-time multi-object human monitoring system designed to not only detect people in a video stream, but also maintain consistent identities (IDs) over time and provide a foundation for higher-level behavior analysis.
+This project implements a real-time multi-person tracking and pose-based action recognition system. It detects people in a video stream, maintains consistent identities (IDs) across frames, estimates body pose, and classifies actions per person using a trained deep learning model.
 
-The system is built as a multi-stage computer vision pipeline, combining modern deep learning models with classical state estimation techniques.
-In the current stage, the project focuses on robust multi-object tracking under resource-constrained environments (CPU-only systems), ensuring system stability and reproducibility.
+The system is built as a modular computer vision pipeline combining YOLOv8, BoT-SORT tracking, and a Bi-GRU + Multi-Head Self-Attention action recognition model.
 
-Core objectives:
+**Core capabilities:**
+- Detect and track multiple persons simultaneously with stable IDs
+- Handle partial occlusions and ID switches via Feature Memory Bank
+- Extract 17-keypoint COCO pose per tracked person every frame
+- Classify actions in real-time: **Fall | Walking | Sitting Quickly | Bending | Lying Down**
+- Operates on CPU-only systems (no GPU required)
 
-Detect humans in video streams using a state-of-the-art object detector.
+---
 
-Track multiple individuals simultaneously while maintaining stable IDs.
+## 2. Quick Start
 
-Handle partial occlusions and crossings between individuals.
+```bash
+# Install dependencies
+pip install -r requirements.txt
 
-Operate in near real-time on systems without dedicated GPU hardware.
+# Run full pipeline (action recognition) on a video
+python main.py --video data/video/video1.mp4
 
-2. System Architecture (High-Level Pipeline)
+# Specify output directory
+python main.py --video data/video/video1.mp4 --out runs/action/my_run
 
-The system follows a modular pipeline design:
+# Tracking only (no action recognition)
+python main.py --video data/video/video1.mp4 --mode track --out runs/track/my_run
 
-Object Detection
-Human detection is performed using YOLOv8 (Ultralytics), configured to detect only the person class for efficiency.
+# Use GPU
+python main.py --video data/video/video1.mp4 --device cuda
 
-Multi-Object Tracking
-Detected bounding boxes are passed to ByteTrack, which integrates Kalman Filter-based motion prediction to maintain consistent identities across frames, even during short-term occlusions or missed detections.
+# Show real-time preview
+python main.py --video data/video/video1.mp4 --preview
+```
 
-Visualization & Monitoring
-Each tracked individual is rendered with a bounding box and a unique ID in the output video stream, allowing real-time inspection of tracking stability.
+**Outputs** (saved to `--out` directory):
+- `video_action.mp4` — annotated video with bounding boxes, skeleton, action labels
+- `actions.csv` — per-frame: `frame, track_id, action, confidence, x1, y1, x2, y2`
+- `summary.json` — run metadata
 
-Pose estimation and behavior classification are intentionally excluded in this phase to isolate and validate the tracking backbone.
+---
 
-3. Computational Constraints & Design Assumptions
+## 3. System Architecture
 
-This project is designed to run on laptop-class machines without GPU acceleration.
-To prevent hardware overload and ensure stable execution, the following constraints and design choices are enforced:
+```
+Video Input
+    │
+    ▼
+[Module A]  src/module_a_detect.py
+    YOLOv8n — detection only (CSV/JSONL + annotated video)
+    │
+    ▼
+[Module B]  src/module_b_botsort_stable.py
+    YOLOv8n + BoT-SORT + Feature Memory Bank + Offline Merge
+    → tracks.csv, tracks_merged.csv, video_track.mp4
+    │
+    ▼
+[Module C]  src/module_c_action.py           ← main pipeline
+    YOLOv8n-Pose + BoT-SORT + Bi-GRU Action Recognition
+    → actions.csv, video_action.mp4
+```
 
-Hardware Assumptions
+`main.py` is the unified entry point that delegates to Module B or Module C based on `--mode`.
 
-CPU-only execution (no CUDA / GPU acceleration)
+---
 
-Consumer-grade laptop hardware
+## 4. Action Recognition Model
 
-Limited thermal headroom
+| Property | Value |
+|----------|-------|
+| Architecture | Bi-GRU (3 layers, 128 hidden) + Multi-Head Self-Attention |
+| Loss | Focal Loss (γ=2.0) + class weights |
+| Optimiser | AdamW + CosineAnnealingWarmRestarts |
+| Input shape | (N, 128, 69) — 17 keypoints × 4 features + aspect ratio |
+| Classes | Fall / Walking / Sitting_Quickly / Bending / Lying_Down |
+| Checkpoint | `runs/train_v3/final_safe_system.pth` |
 
-Enforced System Constraints
+**Training pipeline:**
+```bash
+python extract_pose.py                 # Extract keypoints from UR_Fall + Multicam
+python data_prepare_v3.py             # Build training data (128 frames, 69 features)
+python train_professional_v3.py       # Train Bi-GRU model → runs/train_v3/
+```
 
-Input resolution: downscaled to 640×360 or 854×480
+---
 
-Model size: lightweight detector (yolov8n)
+## 5. Computational Constraints
 
-Target processing rate: 10–15 FPS
+Designed for laptop-class hardware without GPU:
 
-Maximum tracked objects: ≤ 5 persons
+| Constraint | Value |
+|------------|-------|
+| Hardware | CPU-only (no CUDA required) |
+| Detection model | YOLOv8n (lightweight) |
+| Inference speed | ~5–7 f/s on CPU (640px), ~3–4 f/s (1080p+) |
+| Max tracked persons | 50 (configurable via `--max_det`) |
+| Action warmup | 80 frames per track before first prediction |
 
-Video duration for demo/testing: 30–60 seconds
+---
 
-Performance Optimization Strategies
+## 6. Module Reference
 
-Frame skipping: detection is performed every N frames, with intermediate frames handled via Kalman Filter prediction.
+Run individual modules directly:
 
-Class filtering: only the person class is processed.
+```bash
+# Module A — detection only
+python src/module_a_detect.py --video data/video/input.mp4 --out runs/detect/run1
 
-Confidence thresholding: low-confidence detections are discarded to reduce tracker load.
+# Module B — tracking only (BoT-SORT + Memory Bank)
+python src/module_b_botsort_stable.py --video data/video/input.mp4 --out runs/track/run1
 
-Minimal visualization overhead: only bounding boxes and IDs are rendered.
+# Module C — pose + action recognition
+python src/module_c_action.py --video data/video/input.mp4 --out runs/action/run1 \
+    --model_path runs/train_v3/final_safe_system.pth
+```
 
-These constraints allow the system to remain responsive while avoiding sustained high CPU load or thermal stress.
+---
 
-4. Dataset & Input Videos
+## 7. Dataset
 
-The system operates on publicly available video sources intended for academic and research use, including:
+- **UR Fall Detection Dataset** (`data/UR_Fall/`) — image sequences, multiple ADL/fall scenarios
+- **Multicam Dataset** (`data/Multicam/`) — video clips with fall/non-fall annotations
+- Processed keypoints: `data/processed_pose/*.npy` (shape: `(num_frames, 17, 2)`)
+- Training-ready: `data/train_ready_horizontal/` (shape: `(N, 128, 69)`)
 
-Stock videos featuring pedestrian movement in indoor or semi-controlled environments.
+---
 
-Public surveillance-style footage with fixed camera viewpoints.
+## 8. Reproducibility
 
-Benchmark datasets commonly used in multi-object tracking research.
+```bash
+pip install -r requirements.txt
+python main.py --video data/video/video1.mp4 --out runs/action/demo --device cpu
+```
 
-All input videos are preprocessed (resolution and duration) prior to inference to ensure compatibility with CPU-only execution.
-
-5. Project Scope (Current Stage)
-   Included:
-
-Human detection
-
-Multi-object tracking with stable identity assignment
-
-Real-time visualization
-
-Performance evaluation under resource constraints
-
-Explicitly Excluded (Future Work):
-
-Pose estimation
-
-Action / behavior classification
-
-Statistical behavior analytics
-
-GPU acceleration
-
-This staged development approach ensures a solid and verifiable tracking backbone before introducing higher-level semantic analysis.
-
-6. Reproducibility & Stability
-
-The project emphasizes:
-
-Modular code structure
-
-Explicit dependency management
-
-Conservative runtime configuration
-
-Hardware-aware optimization
-
-These principles ensure that the system can be reproduced and demonstrated reliably across different CPU-only environments.
+The system produces deterministic results on CPU. All components are modular and independently runnable.

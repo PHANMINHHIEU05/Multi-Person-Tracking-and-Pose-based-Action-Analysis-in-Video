@@ -8,13 +8,13 @@ Pipeline:
   4. Update every PRED_STRIDE=16 new frames (sliding window)
   5. Output annotated video + CSV
 
-Model:  runs/train_v3/final_safe_system.pth
+Model:  runs/train_horizontal/final_safe_system.pth
 Pose:   yolov8n-pose.pt
 
 Usage:
     python src/module_c_action.py --video data/video/input.mp4
     python src/module_c_action.py --video data/video/input.mp4 \\
-        --model_path runs/train_v3/final_safe_system.pth \\
+        --model_path runs/train_horizontal/final_safe_system.pth \\
         --pose_model yolov8n-pose.pt --out runs/action/run1 --preview
 """
 
