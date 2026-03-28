@@ -15,7 +15,7 @@ export default function ControlPanel({ status, onStart, onStop }) {
   const [conf, setConf] = useState(0.4);
   const [imgsz, setImgsz] = useState(480);
   const [modelPath, setModelPath] = useState(
-    "runs/train_v3/final_safe_system.pth",
+    "runs/train_horizontal/final_safe_system.pth",
   );
   const [errorMsg, setErrorMsg] = useState("");
   const [runId, setRunId] = useState(null);

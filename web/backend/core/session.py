@@ -13,8 +13,9 @@ class RunSession:
     video_path: str
     output_dir: str
     status: str = "pending"          # pending | running | done | stopped | error
-    # maxsize=120 ≈ 4 s buffer @ 30 fps; pipeline drops frames when full
-    queue: asyncio.Queue = field(default_factory=lambda: asyncio.Queue(maxsize=120))
+    # Keep this queue small to prioritize low-latency preview over completeness.
+    # If the browser is slower than inference, old frames are dropped quickly.
+    queue: asyncio.Queue = field(default_factory=lambda: asyncio.Queue(maxsize=12))
     stop_event: threading.Event = field(default_factory=threading.Event)
     thread: Optional[threading.Thread] = None
     total_frames: int = 0

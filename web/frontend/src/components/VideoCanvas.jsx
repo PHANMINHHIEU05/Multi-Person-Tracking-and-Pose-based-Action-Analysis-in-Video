@@ -1,26 +1,23 @@
 import { useEffect, useRef } from "react";
 
 /**
- * High-performance video canvas.
- *
- * Instead of re-rendering on every React state change, this component reads
- * the latest ImageBitmap directly from a ref (bitmapRef) and paints it inside
- * a requestAnimationFrame loop.  This keeps frame delivery completely off the
- * React render cycle and avoids GC pressure from base64 strings.
- *
- * Props:
- *   bitmapRef  — React ref whose .current is an ImageBitmap (from useWebSocket)
- *   isRunning  — boolean, controls whether the rAF loop is active
+ * PERF: Worker-based canvas renderer (no React state updates per frame).
  */
-export default function VideoCanvas({ bitmapRef, isRunning }) {
+export default function VideoCanvas({ isRunning, setFrameHandler }) {
   const canvasRef = useRef(null);
-  const rafRef = useRef(null);
-  const lastBitmapRef = useRef(null);
+  const workerRef = useRef(null);
+  const ctxRef = useRef(null);
+  const runningRef = useRef(false);
+
+  useEffect(() => {
+    runningRef.current = isRunning;
+  }, [isRunning]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
-    const ctx = canvas.getContext("2d");
+    const ctx = canvas.getContext("2d", { alpha: false }); // PERF: faster compositing
+    ctxRef.current = ctx;
 
     const drawPlaceholder = () => {
       canvas.width = 854;
@@ -30,33 +27,52 @@ export default function VideoCanvas({ bitmapRef, isRunning }) {
       ctx.fillStyle = "#475569";
       ctx.font = "16px Inter, sans-serif";
       ctx.textAlign = "center";
-      ctx.fillText("No video — upload and Start", canvas.width / 2, canvas.height / 2);
+      ctx.fillText(
+        "No video — upload and Start",
+        canvas.width / 2,
+        canvas.height / 2,
+      );
     };
 
-    if (!isRunning) {
-      drawPlaceholder();
-      return;
+    drawPlaceholder();
+
+    // PERF: Create worker once; JPEG decode happens off main thread.
+    const worker = new Worker("/frameWorker.js");
+    workerRef.current = worker;
+
+    worker.onmessage = (evt) => {
+      if (evt.data?.type !== "bitmap") return;
+      const bitmap = evt.data.bitmap;
+      if (!bitmap || !ctxRef.current) return;
+      const c = canvasRef.current;
+      if (!c) {
+        bitmap.close();
+        return;
+      }
+      if (c.width !== bitmap.width || c.height !== bitmap.height) {
+        c.width = bitmap.width;
+        c.height = bitmap.height;
+      }
+      ctxRef.current.drawImage(bitmap, 0, 0);
+      bitmap.close(); // PERF: release bitmap memory immediately
+    };
+
+    // PERF: Expose non-state frame handler to websocket hook.
+    if (typeof setFrameHandler === "function") {
+      setFrameHandler((blob) => {
+        if (!runningRef.current || !workerRef.current) return;
+        workerRef.current.postMessage({ type: "frame", blob });
+      });
     }
 
-    const loop = () => {
-      const bmp = bitmapRef.current;
-      if (bmp && bmp !== lastBitmapRef.current) {
-        // Resize canvas to match video aspect ratio (once per size change)
-        if (canvas.width !== bmp.width || canvas.height !== bmp.height) {
-          canvas.width = bmp.width;
-          canvas.height = bmp.height;
-        }
-        ctx.drawImage(bmp, 0, 0);
-        lastBitmapRef.current = bmp;
-      }
-      rafRef.current = requestAnimationFrame(loop);
-    };
-
-    rafRef.current = requestAnimationFrame(loop);
     return () => {
-      if (rafRef.current) cancelAnimationFrame(rafRef.current);
+      if (typeof setFrameHandler === "function") setFrameHandler(null);
+      if (workerRef.current) {
+        workerRef.current.terminate();
+        workerRef.current = null;
+      }
     };
-  }, [isRunning, bitmapRef]);
+  }, [setFrameHandler]);
 
   return (
     <canvas

@@ -20,7 +20,7 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 DEFAULT_MODEL = str(
     Path(__file__).parent.parent.parent.parent
-    / "runs/train_v3/final_safe_system.pth"
+    / "runs/train_horizontal/final_safe_system.pth"
 )
 
 router = APIRouter()

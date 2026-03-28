@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useCallback, useRef, useState } from "react";
 import { useWebSocket } from "./hooks/useWebSocket";
 import VideoCanvas from "./components/VideoCanvas";
 import ControlPanel from "./components/ControlPanel";
@@ -8,8 +8,18 @@ import FallAlert from "./components/FallAlert";
 import HistoryList from "./components/HistoryList";
 
 function App() {
+  const frameHandlerRef = useRef(null);
+  const handleIncomingFrame = useCallback((blob) => {
+    // PERF: stable callback so websocket can stream frames without handler churn
+    if (frameHandlerRef.current) frameHandlerRef.current(blob);
+  }, []);
+
+  const setCanvasFrameHandler = useCallback((fn) => {
+    // PERF: stable setter avoids recreating worker on each App render
+    frameHandlerRef.current = fn;
+  }, []);
+
   const {
-    bitmapRef,
     tracks,
     counts,
     fallAlert,
@@ -18,7 +28,7 @@ function App() {
     frameIdx,
     connect,
     disconnect,
-  } = useWebSocket();
+  } = useWebSocket(handleIncomingFrame);
   const [runId, setRunId] = useState(null);
 
   const handleStart = (id) => {
@@ -61,7 +71,10 @@ function App() {
         {/* Center — Video */}
         <section className="flex-1 flex flex-col gap-3 p-4 min-w-0">
           <FallAlert active={fallAlert} />
-          <VideoCanvas bitmapRef={bitmapRef} isRunning={status === "running"} />
+          <VideoCanvas
+            isRunning={status === "running"}
+            setFrameHandler={setCanvasFrameHandler}
+          />
         </section>
 
         {/* Right — Analytics */}

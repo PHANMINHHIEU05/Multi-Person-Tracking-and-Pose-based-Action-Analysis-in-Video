@@ -70,7 +70,7 @@ def build_parser() -> argparse.ArgumentParser:
                         "track: BoT-SORT tracking only (no action)")
 
     # Action recognition options (mode=action)
-    p.add_argument("--model_path",  default="runs/train_v3/final_safe_system.pth",
+    p.add_argument("--model_path",  default="runs/train_horizontal/final_safe_system.pth",
                    help="Trained Bi-GRU checkpoint (.pth) — mode=action only")
     p.add_argument("--pose_model",  default="yolov8n-pose.pt",
                    help="YOLOv8-Pose weights — mode=action only")
