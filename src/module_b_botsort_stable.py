@@ -169,12 +169,19 @@ def _parse_resize(s: str) -> Optional[Tuple[int, int]]:
 #  Video I/O
 # --------------------------------------------------------------------------- #
 def open_video(path: str) -> cv2.VideoCapture:
-    if not Path(path).exists():
-        print(f"[ERROR] Video not found: {path}", file=sys.stderr)
+    # Support file paths, webcam index (0, 1, ...), and stream URLs (rtsp://, http://, etc.)
+    is_stream = path.isdigit() or path.startswith((
+        "rtsp://", "rtsps://", "http://", "https://", "rtmp://", "udp://", "file://"
+    ))
+
+    # Only check file existence for non-stream inputs
+    if not is_stream and not Path(path).exists():
+        print(f"[ERROR] Video file not found: {path}", file=sys.stderr)
         sys.exit(1)
+
     cap = cv2.VideoCapture(path)
     if not cap.isOpened():
-        print(f"[ERROR] Cannot open: {path}", file=sys.stderr)
+        print(f"[ERROR] Cannot open video source: {path}", file=sys.stderr)
         sys.exit(1)
     return cap
 

@@ -409,6 +409,10 @@ def process_video(args):
     W      = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     H      = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     total  = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    
+    # Handle streams (webcam, RTSP) where frame count is unavailable
+    is_stream = (total == 0)
+    total_display = f"~{total}" if total > 0 else "streaming (unknown)"
 
     # Output video
     out_video_path = str(out_dir / "video_action.mp4")
@@ -422,14 +426,14 @@ def process_video(args):
     csv_writer.writerow(["frame", "track_id", "action", "confidence",
                          "x1", "y1", "x2", "y2"])
 
-    print(f"\n[Module C] Video: {args.video}  ({W}×{H} @ {fps:.1f}fps, {total} frames)")
+    print(f"\n[Module C] Video: {args.video}  ({W}×{H} @ {fps:.1f}fps, {total_display})")
     print(f"[Module C] Output: {out_dir}/")
 
     # ── Tracking config ────────────────────────────────────────────────
     tracker_cfg = args.tracker   # "botsort.yaml" or "bytetrack.yaml"
 
     frame_idx = 0
-    pbar = tqdm(total=total, desc="Processing", unit="f")
+    pbar = tqdm(total=max(1, total), desc="Processing", unit="f")
 
     while True:
         ret, frame = cap.read()

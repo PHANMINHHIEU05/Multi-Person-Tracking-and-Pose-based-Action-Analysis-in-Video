@@ -12,10 +12,10 @@ export default function ControlPanel({ status, onStart, onStop }) {
   const [file, setFile] = useState(null);
   const [fileId, setFileId] = useState(null);
   const [uploadProgress, setUploadProgress] = useState(0);
-  const [conf, setConf] = useState(0.55);
-  const [imgsz, setImgsz] = useState(640);
+  const [conf, setConf] = useState(0.4);
+  const [imgsz, setImgsz] = useState(480);
   const [modelPath, setModelPath] = useState(
-    "runs/train_horizontal/final_safe_system.pth",
+    "runs/train_v3/final_safe_system.pth",
   );
   const [errorMsg, setErrorMsg] = useState("");
   const [runId, setRunId] = useState(null);

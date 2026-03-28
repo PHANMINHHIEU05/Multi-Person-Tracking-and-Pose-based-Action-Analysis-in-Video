@@ -8,19 +8,35 @@ Modes
   action (default)  — YOLOv8n-Pose + BoT-SORT + Bi-GRU action recognition
   track             — YOLOv8n + BoT-SORT tracking only
 
-Usage
------
-  # Full pipeline (action recognition) – uses canonical v3 model by default
+Input Sources
+-------------
+  • Video file:    data/video/video1.mp4
+  • Webcam:        0 (default), 1, 2, ... (camera index)
+  • RTSP stream:   rtsp://user:pass@camera_ip:554/stream
+  • HTTP stream:   http://camera_ip:port/mjpeg or rtmp://...
+
+Usage Examples
+--------------
+  # File – Full pipeline (action recognition)
   python main.py --video data/video/video1.mp4
 
-  # Specify output directory and device
-  python main.py --video data/video/video1.mp4 --out runs/action/demo --device cpu
+  # Webcam – Live tracking + action recognition with preview
+  python main.py --video 0 --preview
 
-  # Tracking only (no action recognition)
-  python main.py --video data/video/video1.mp4 --mode track --out runs/track/demo
+  # Webcam – Tracking only, higher resolution
+  python main.py --video 0 --mode track --imgsz 1280 --preview
 
-  # Show real-time preview window
-  python main.py --video data/video/video1.mp4 --preview
+  # RTSP stream from IP camera
+  python main.py --video "rtsp://admin:password@192.168.1.100:554/stream" --preview
+
+  # Specify output and device
+  python main.py --video 0 --out runs/action/webcam_demo --device cuda --preview
+
+  # Disable skeleton overlay (faster on slow networks)
+  python main.py --video 0 --no_skeleton --preview
+
+  # Adjust detection confidence (lower = more detections)
+  python main.py --video 0 --conf 0.15 --preview
 """
 
 from __future__ import annotations
@@ -54,7 +70,7 @@ def build_parser() -> argparse.ArgumentParser:
                         "track: BoT-SORT tracking only (no action)")
 
     # Action recognition options (mode=action)
-    p.add_argument("--model_path",  default="runs/train_horizontal/final_safe_system.pth",
+    p.add_argument("--model_path",  default="runs/train_v3/final_safe_system.pth",
                    help="Trained Bi-GRU checkpoint (.pth) — mode=action only")
     p.add_argument("--pose_model",  default="yolov8n-pose.pt",
                    help="YOLOv8-Pose weights — mode=action only")

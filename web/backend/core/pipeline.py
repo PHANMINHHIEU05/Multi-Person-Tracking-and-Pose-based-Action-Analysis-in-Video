@@ -21,6 +21,7 @@ import queue as stdlib_queue
 
 import cv2
 import numpy as np
+import torch
 
 # Only send every Nth frame over WebSocket to reduce JPEG-encode + network overhead.
 # All frames are still processed for tracking accuracy and saved to output video.
@@ -112,6 +113,8 @@ def run_pipeline(session: RunSession, model_path: str, conf: float,
     try:
         session.status = "running"
         pose_model = YOLO(str(ROOT / "yolov8n-pose.pt"))
+        # FP16 on CPU is often slower; enable half precision only when CUDA exists.
+        use_half = bool(torch.cuda.is_available())
         recognizer = ActionRecognizer(
             model_path=model_path,
             device="auto",
@@ -168,7 +171,7 @@ def run_pipeline(session: RunSession, model_path: str, conf: float,
                 classes=[0],
                 tracker=tracker_cfg,
                 verbose=False,
-                half=True,   # FP16 inference on CUDA — ~2× faster, ignored on CPU
+                half=use_half,
             )
             result = results[0]
             active_ids = set()
