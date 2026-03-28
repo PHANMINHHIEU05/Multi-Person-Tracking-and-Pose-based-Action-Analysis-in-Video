@@ -18,7 +18,7 @@ import torch  # REFACTOR:
 import src.module_c_action as module_c_action  # FIX: runtime tuning hooks without modifying module_c_action.py file
 
 STREAM_EVERY = 1  # REFACTOR: send metadata every frame for tighter overlay sync
-INFER_EVERY = 3  # REFACTOR: # FIX: run recognizer every N frames to stabilize predictions and reduce compute
+INFER_EVERY = 1  # REFACTOR: # FIX: prioritize responsiveness by evaluating action every frame
 DRAW_SKELETON = False  # REFACTOR: optional drawing only for output video
 DRAW_LABEL = True  # REFACTOR: keep action labels for output artifact
 io_executor = ThreadPoolExecutor(max_workers=2)  # REFACTOR: non-blocking CSV/file I/O tasks
@@ -192,9 +192,9 @@ def run_pipeline(session: RunSession, model_path: str,
             num_layers=3,
             num_heads=8,
         )
-        module_c_action.MIN_TRACK_FRAMES = min(module_c_action.MIN_TRACK_FRAMES, 24)  # FIX: emit predictions earlier on short clips and ID-switch scenarios
-        module_c_action.PRED_STRIDE = min(module_c_action.PRED_STRIDE, 8)  # FIX: refresh action labels more frequently
-        module_c_action.CONF_THRESHOLD = min(module_c_action.CONF_THRESHOLD, 0.40)  # FIX: avoid over-suppressing valid class outputs
+        module_c_action.MIN_TRACK_FRAMES = min(module_c_action.MIN_TRACK_FRAMES, 8)  # FIX: allow early action output similar to direct model testing
+        module_c_action.PRED_STRIDE = min(module_c_action.PRED_STRIDE, 1)  # FIX: remove stride delay so predictions can update every frame
+        module_c_action.CONF_THRESHOLD = min(module_c_action.CONF_THRESHOLD, 0.25)  # FIX: increase sensitivity by accepting moderate-confidence predictions
         print(
             f"[PIPELINE] action runtime gates: MIN_TRACK_FRAMES={module_c_action.MIN_TRACK_FRAMES}, "
             f"PRED_STRIDE={module_c_action.PRED_STRIDE}, CONF_THRESHOLD={module_c_action.CONF_THRESHOLD:.2f}"
