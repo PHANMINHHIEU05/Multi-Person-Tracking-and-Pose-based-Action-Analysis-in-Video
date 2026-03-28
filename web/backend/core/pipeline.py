@@ -8,13 +8,14 @@ import sys  # REFACTOR:
 import threading  # REFACTOR:
 import time  # REFACTOR:
 import traceback
-from collections import defaultdict, deque  # REFACTOR: # FIX: use deque for explicit per-track temporal buffering
+from collections import defaultdict  # REFACTOR: # FIX: action inference now relies on recognizer internal buffers
 from concurrent.futures import ThreadPoolExecutor  # REFACTOR:
 from pathlib import Path  # REFACTOR:
 
 import cv2  # REFACTOR:
 import numpy as np  # REFACTOR:
 import torch  # REFACTOR:
+import src.module_c_action as module_c_action  # FIX: runtime tuning hooks without modifying module_c_action.py file
 
 STREAM_EVERY = 1  # REFACTOR: send metadata every frame for tighter overlay sync
 INFER_EVERY = 3  # REFACTOR: # FIX: run recognizer every N frames to stabilize predictions and reduce compute
@@ -36,8 +37,8 @@ from src.module_c_action import (  # noqa: E402  # REFACTOR:
     extract_kpts_for_track,
 )
 
-WINDOW_SIZE = SEQ_LEN  # FIX: align temporal window with model training sequence length
-MIN_FRAMES = MIN_TRACK_FRAMES  # FIX: require enough temporal context before emitting predictions
+WINDOW_SIZE = SEQ_LEN  # FIX: retained for documentation of training-aligned temporal context
+MIN_FRAMES = MIN_TRACK_FRAMES  # FIX: retained for documentation of recognizer warm-up requirement
 from web.backend.core.session import RunSession  # noqa: E402  # REFACTOR:
 
 
@@ -180,7 +181,6 @@ def run_pipeline(session: RunSession, model_path: str,
         pose_model.predict(_dummy, verbose=False)  # FIX: trigger kernels and graph setup before main loop
         del _dummy  # FIX: release warm-up tensor
 
-        keypoint_buffers: dict[int, deque] = defaultdict(lambda: deque(maxlen=WINDOW_SIZE))  # FIX: maintain explicit temporal context per track
         last_actions: dict[int, tuple[int, float, str]] = {}  # FIX: cache latest prediction per track_id
         _infer_counter = 0  # FIX: cadence counter for batched/cadenced inference
 
@@ -191,6 +191,13 @@ def run_pipeline(session: RunSession, model_path: str,
             hidden_dim=128,
             num_layers=3,
             num_heads=8,
+        )
+        module_c_action.MIN_TRACK_FRAMES = min(module_c_action.MIN_TRACK_FRAMES, 24)  # FIX: emit predictions earlier on short clips and ID-switch scenarios
+        module_c_action.PRED_STRIDE = min(module_c_action.PRED_STRIDE, 8)  # FIX: refresh action labels more frequently
+        module_c_action.CONF_THRESHOLD = min(module_c_action.CONF_THRESHOLD, 0.40)  # FIX: avoid over-suppressing valid class outputs
+        print(
+            f"[PIPELINE] action runtime gates: MIN_TRACK_FRAMES={module_c_action.MIN_TRACK_FRAMES}, "
+            f"PRED_STRIDE={module_c_action.PRED_STRIDE}, CONF_THRESHOLD={module_c_action.CONF_THRESHOLD:.2f}"
         )
 
         cap = cv2.VideoCapture(session.video_path)  # REFACTOR:
@@ -283,22 +290,14 @@ def run_pipeline(session: RunSession, model_path: str,
                 for tid, keypoints in zip(track_ids, all_keypoints):  # FIX: buffered per-track update and infer gate
                     tid_i = int(tid)  # FIX:
                     active_ids.add(tid_i)  # FIX:
-                    if keypoints is not None:  # FIX:
-                        keypoint_buffers[tid_i].append(keypoints)  # FIX:
                     recognizer.update_track(tid_i, keypoints)  # FIX: preserve module_c_action API usage
 
-                    if len(keypoint_buffers[tid_i]) >= MIN_FRAMES:  # FIX: only infer when enough temporal context exists
-                        if _infer_counter % INFER_EVERY == 0:  # FIX:
-                            last_actions[tid_i] = recognizer.predict(tid_i)  # FIX: keep existing recognizer signature
-                        else:
-                            last_actions.setdefault(tid_i, (-1, 0.0, "unknown"))  # FIX: hold last stable result between infer ticks
+                    if _infer_counter % INFER_EVERY == 0:  # FIX: cadence control only; recognizer handles internal min-frame gate
+                        pred = recognizer.predict(tid_i)  # FIX: keep existing recognizer signature
+                        if pred[2] != "?":  # FIX: update cache only when recognizer emits a valid class label
+                            last_actions[tid_i] = pred  # FIX:
                     else:
-                        last_actions[tid_i] = (-1, 0.0, "unknown")  # FIX: avoid premature guesses on short buffers
-
-                for tid in list(keypoint_buffers.keys()):  # FIX: prune inactive tracks to prevent stale memory growth
-                    if tid not in active_ids:
-                        del keypoint_buffers[tid]  # FIX:
-                        last_actions.pop(tid, None)  # FIX:
+                        last_actions.setdefault(tid_i, (-1, 0.0, "unknown"))  # FIX: hold latest known label between inference ticks
 
                 for i, tid in enumerate(track_ids):
                     tid_i = int(tid)  # REFACTOR:

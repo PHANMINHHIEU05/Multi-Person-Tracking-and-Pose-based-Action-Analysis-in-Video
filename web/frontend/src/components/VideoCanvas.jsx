@@ -9,6 +9,7 @@ export default function VideoCanvas({
   const videoRef = useRef(null); // REFACTOR:
   const canvasRef = useRef(null); // REFACTOR:
   const rafRef = useRef(null); // REFACTOR:
+  const lastGoodMetaRef = useRef(null); // # FIX: hold last valid metadata to avoid flicker on brief websocket gaps
 
   useEffect(() => {
     // REFACTOR:
@@ -35,24 +36,60 @@ export default function VideoCanvas({
       if (!video.videoWidth) return; // REFACTOR:
 
       const currentTime = video.currentTime || 0; // # FIX: synchronize overlay using video playback time
+      const MAX_SYNC_DRIFT_SEC = 0.2; // # FIX: strict sync threshold for selecting a "fresh" metadata frame
+      const HOLD_LAST_META_SEC = 0.5; // # FIX: grace window to keep last good bbox instead of clearing instantly
       const buf = frameMetaBuffer.current; // # FIX:
-      if (!buf.length) return; // # FIX:
+      if (!buf.length) {
+        const fallback = lastGoodMetaRef.current; // # FIX:
+        const fallbackTs = Number(
+          fallback?.timestamp ?? fallback?.sourceTimeSec ?? -999,
+        ); // # FIX:
+        if (
+          fallback &&
+          Math.abs(fallbackTs - currentTime) <= HOLD_LAST_META_SEC
+        ) {
+          // # FIX: keep drawing recent stable bbox when metadata queue momentarily stalls
+        } else {
+          ctx.clearRect(0, 0, canvas.width, canvas.height); // # FIX:
+          return; // # FIX:
+        }
+      }
 
-      const meta = buf.reduce((prev, cur) => {
-        // # FIX: pick closest metadata snapshot by timestamp
-        const curTs = Number(cur.timestamp ?? cur.sourceTimeSec ?? 0); // # FIX:
-        const prevTs = Number(prev.timestamp ?? prev.sourceTimeSec ?? 0); // # FIX:
-        return Math.abs(curTs - currentTime) < Math.abs(prevTs - currentTime) // # FIX:
-          ? cur // # FIX:
-          : prev; // # FIX:
-      });
+      const nearestMeta = buf.length
+        ? buf.reduce((prev, cur) => {
+            // # FIX: pick closest metadata snapshot by timestamp
+            const curTs = Number(cur.timestamp ?? cur.sourceTimeSec ?? 0); // # FIX:
+            const prevTs = Number(prev.timestamp ?? prev.sourceTimeSec ?? 0); // # FIX:
+            return Math.abs(curTs - currentTime) <
+              Math.abs(prevTs - currentTime) // # FIX:
+              ? cur // # FIX:
+              : prev; // # FIX:
+          })
+        : null; // # FIX:
 
-      const metaTs = Number(meta.timestamp ?? meta.sourceTimeSec ?? 0); // # FIX:
-      if (Math.abs(metaTs - currentTime) > 0.2) {
-        // # FIX: clear overlay when metadata is older/newer than 200ms
+      let meta = nearestMeta; // # FIX:
+      let metaTs = Number(meta?.timestamp ?? meta?.sourceTimeSec ?? -999); // # FIX:
+      if (!meta || Math.abs(metaTs - currentTime) > MAX_SYNC_DRIFT_SEC) {
+        const fallback = lastGoodMetaRef.current; // # FIX:
+        const fallbackTs = Number(
+          fallback?.timestamp ?? fallback?.sourceTimeSec ?? -999,
+        ); // # FIX:
+        if (
+          fallback &&
+          Math.abs(fallbackTs - currentTime) <= HOLD_LAST_META_SEC
+        ) {
+          meta = fallback; // # FIX: reuse last good overlay snapshot during brief mismatch spikes
+          metaTs = fallbackTs; // # FIX:
+        }
+      }
+
+      if (!meta || Math.abs(metaTs - currentTime) > HOLD_LAST_META_SEC) {
+        // # FIX: clear only when both fresh and fallback metadata are too stale
         ctx.clearRect(0, 0, canvas.width, canvas.height); // # FIX:
         return; // # FIX:
       }
+
+      lastGoodMetaRef.current = meta; // # FIX: update sticky fallback state with latest drawable metadata
 
       ctx.clearRect(0, 0, canvas.width, canvas.height); // REFACTOR:
 
