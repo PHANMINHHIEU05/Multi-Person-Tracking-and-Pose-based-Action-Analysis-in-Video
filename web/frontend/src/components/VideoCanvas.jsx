@@ -1,83 +1,126 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef } from "react"; // REFACTOR:
 
-/**
- * PERF: Worker-based canvas renderer (no React state updates per frame).
- */
-export default function VideoCanvas({ isRunning, setFrameHandler }) {
-  const canvasRef = useRef(null);
-  const workerRef = useRef(null);
-  const ctxRef = useRef(null);
-  const runningRef = useRef(false);
-
-  useEffect(() => {
-    runningRef.current = isRunning;
-  }, [isRunning]);
+export default function VideoCanvas({
+  videoUrl,
+  frameMetaBuffer,
+  videoFps = 30,
+}) {
+  // REFACTOR:
+  const videoRef = useRef(null); // REFACTOR:
+  const canvasRef = useRef(null); // REFACTOR:
+  const rafRef = useRef(null); // REFACTOR:
 
   useEffect(() => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const ctx = canvas.getContext("2d", { alpha: false }); // PERF: faster compositing
-    ctxRef.current = ctx;
+    // REFACTOR:
+    const video = videoRef.current; // REFACTOR:
+    const canvas = canvasRef.current; // REFACTOR:
+    if (!video || !canvas) return; // REFACTOR:
 
-    const drawPlaceholder = () => {
-      canvas.width = 854;
-      canvas.height = 480;
-      ctx.fillStyle = "#0f172a";
-      ctx.fillRect(0, 0, canvas.width, canvas.height);
-      ctx.fillStyle = "#475569";
-      ctx.font = "16px Inter, sans-serif";
-      ctx.textAlign = "center";
-      ctx.fillText(
-        "No video — upload and Start",
-        canvas.width / 2,
-        canvas.height / 2,
-      );
-    };
+    const ctx = canvas.getContext("2d", { alpha: true }); // REFACTOR:
+    if (!ctx) return; // REFACTOR:
 
-    drawPlaceholder();
+    function syncCanvasSize() {
+      // REFACTOR:
+      canvas.width = video.videoWidth || 854; // REFACTOR:
+      canvas.height = video.videoHeight || 480; // REFACTOR:
+    }
 
-    // PERF: Create worker once; JPEG decode happens off main thread.
-    const worker = new Worker("/frameWorker.js");
-    workerRef.current = worker;
+    video.addEventListener("loadedmetadata", syncCanvasSize); // REFACTOR:
+    syncCanvasSize(); // REFACTOR:
 
-    worker.onmessage = (evt) => {
-      if (evt.data?.type !== "bitmap") return;
-      const bitmap = evt.data.bitmap;
-      if (!bitmap || !ctxRef.current) return;
-      const c = canvasRef.current;
-      if (!c) {
-        bitmap.close();
-        return;
+    function drawOverlay() {
+      // REFACTOR:
+      rafRef.current = requestAnimationFrame(drawOverlay); // REFACTOR:
+
+      if (!video.videoWidth) return; // REFACTOR:
+
+      const currentTime = video.currentTime || 0; // # FIX: synchronize overlay using video playback time
+      const buf = frameMetaBuffer.current; // # FIX:
+      if (!buf.length) return; // # FIX:
+
+      const meta = buf.reduce((prev, cur) => {
+        // # FIX: pick closest metadata snapshot by timestamp
+        const curTs = Number(cur.timestamp ?? cur.sourceTimeSec ?? 0); // # FIX:
+        const prevTs = Number(prev.timestamp ?? prev.sourceTimeSec ?? 0); // # FIX:
+        return Math.abs(curTs - currentTime) < Math.abs(prevTs - currentTime) // # FIX:
+          ? cur // # FIX:
+          : prev; // # FIX:
+      });
+
+      const metaTs = Number(meta.timestamp ?? meta.sourceTimeSec ?? 0); // # FIX:
+      if (Math.abs(metaTs - currentTime) > 0.2) {
+        // # FIX: clear overlay when metadata is older/newer than 200ms
+        ctx.clearRect(0, 0, canvas.width, canvas.height); // # FIX:
+        return; // # FIX:
       }
-      if (c.width !== bitmap.width || c.height !== bitmap.height) {
-        c.width = bitmap.width;
-        c.height = bitmap.height;
-      }
-      ctxRef.current.drawImage(bitmap, 0, 0);
-      bitmap.close(); // PERF: release bitmap memory immediately
-    };
 
-    // PERF: Expose non-state frame handler to websocket hook.
-    if (typeof setFrameHandler === "function") {
-      setFrameHandler((blob) => {
-        if (!runningRef.current || !workerRef.current) return;
-        workerRef.current.postMessage({ type: "frame", blob });
+      ctx.clearRect(0, 0, canvas.width, canvas.height); // REFACTOR:
+
+      const scaleX = canvas.width / (meta.inferenceWidth || canvas.width); // REFACTOR:
+      const scaleY = canvas.height / (meta.inferenceHeight || canvas.height); // REFACTOR:
+
+      meta.tracks?.forEach(({ id, bbox, action, conf }) => {
+        // REFACTOR:
+        if (!bbox || bbox.length < 4) return; // REFACTOR:
+        const [x1, y1, x2, y2] = bbox; // REFACTOR:
+        const sx1 = x1 * scaleX; // REFACTOR:
+        const sy1 = y1 * scaleY; // REFACTOR:
+        const sw = (x2 - x1) * scaleX; // REFACTOR:
+        const sh = (y2 - y1) * scaleY; // REFACTOR:
+
+        const isFall = String(action || "")
+          .toLowerCase()
+          .includes("fall"); // REFACTOR:
+        const color = isFall ? "#E24B4A" : "#1D9E75"; // REFACTOR:
+
+        ctx.strokeStyle = color; // REFACTOR:
+        ctx.lineWidth = 2; // REFACTOR:
+        ctx.strokeRect(sx1, sy1, sw, sh); // REFACTOR:
+
+        const label = `ID:${id} ${action} ${Math.round((conf ?? 0) * 100)}%`; // REFACTOR:
+        ctx.font = "bold 13px sans-serif"; // # FIX: match requested label style
+        const tw = ctx.measureText(label).width; // REFACTOR:
+        ctx.fillStyle = color; // REFACTOR:
+        ctx.fillRect(sx1, sy1 - 22, tw + 10, 22); // # FIX: larger label background for readability
+
+        ctx.fillStyle = "#ffffff"; // REFACTOR:
+        ctx.fillText(label, sx1 + 5, sy1 - 6); // # FIX: align text baseline with updated label box
       });
     }
 
+    rafRef.current = requestAnimationFrame(drawOverlay); // REFACTOR:
+
     return () => {
-      if (typeof setFrameHandler === "function") setFrameHandler(null);
-      if (workerRef.current) {
-        workerRef.current.terminate();
-        workerRef.current = null;
-      }
+      // REFACTOR:
+      if (rafRef.current) cancelAnimationFrame(rafRef.current); // REFACTOR:
+      video.removeEventListener("loadedmetadata", syncCanvasSize); // REFACTOR:
     };
-  }, [setFrameHandler]);
+  }, [videoUrl, frameMetaBuffer, videoFps]); // REFACTOR:
 
   return (
-    <canvas
-      ref={canvasRef}
-      className="w-full rounded-lg border border-slate-700 bg-slate-900"
-    />
+    // REFACTOR:
+    <div style={{ position: "relative", width: "100%" }}>
+      {" "}
+      {/* REFACTOR: */}
+      <video // REFACTOR:
+        ref={videoRef} // REFACTOR:
+        src={videoUrl || ""} // REFACTOR:
+        controls // REFACTOR:
+        autoPlay={false} // REFACTOR:
+        style={{ width: "100%", display: "block" }} // REFACTOR:
+      />
+      <canvas // REFACTOR:
+        ref={canvasRef} // REFACTOR:
+        style={{
+          // REFACTOR:
+          position: "absolute", // REFACTOR:
+          top: 0, // REFACTOR:
+          left: 0, // REFACTOR:
+          width: "100%", // REFACTOR:
+          height: "100%", // REFACTOR:
+          pointerEvents: "none", // REFACTOR:
+        }}
+      />
+    </div>
   );
 }

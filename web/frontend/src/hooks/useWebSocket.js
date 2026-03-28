@@ -1,108 +1,123 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react"; // REFACTOR:
 
-const WS_BASE = import.meta.env.VITE_WS_BASE ?? "ws://localhost:8000";
+const WS_BASE = import.meta.env.VITE_WS_BASE ?? "ws://localhost:8000"; // REFACTOR:
+const META_BUFFER_LIMIT = 300; // # FIX: cap metadata buffer at 300 entries per requirement
 
-/**
- * PERF: WebSocket hook optimized for low-overhead realtime playback.
- */
-export function useWebSocket(handleFrame) {
-  const wsRef = useRef(null); // PERF: socket ref avoids rerenders
-  const metaRef = useRef({}); // PERF: metadata cache without state churn
-  const [status, setStatus] = useState("idle");
+export function useWebSocket() {
+  // REFACTOR:
+  const wsRef = useRef(null); // REFACTOR:
+  const frameMetaBuffer = useRef([]); // REFACTOR: rolling metadata buffer for video-time sync
+  const [status, setStatus] = useState("idle"); // REFACTOR:
   const [dashboardData, setDashboardData] = useState({
+    // REFACTOR:
     tracks: [],
-    counts: {},
-    fallAlert: false,
+    action_counts: {},
+    fall_alert: false,
     fps: 0,
-    frameIdx: 0,
+    frame_idx: 0,
   });
 
-  const disconnect = useCallback(() => {
-    if (wsRef.current) {
-      wsRef.current.close();
-      wsRef.current = null;
+  const handleStatus = useCallback((nextStatus) => {
+    // REFACTOR:
+    setStatus(nextStatus ?? "idle"); // REFACTOR:
+    if (
+      nextStatus === "done" ||
+      nextStatus === "stopped" ||
+      nextStatus === "error"
+    ) {
+      // REFACTOR:
+      wsRef.current = null; // REFACTOR:
     }
-    metaRef.current = {};
-    setStatus("idle");
+  }, []);
+
+  const disconnect = useCallback(() => {
+    // REFACTOR:
+    if (wsRef.current) {
+      // REFACTOR:
+      wsRef.current.close(); // REFACTOR:
+      wsRef.current = null; // REFACTOR:
+    }
+    frameMetaBuffer.current = []; // REFACTOR:
+    setStatus("idle"); // REFACTOR:
   }, []);
 
   const connect = useCallback(
-    (run_id) => {
-      if (wsRef.current) wsRef.current.close();
+    (runId) => {
+      // REFACTOR:
+      if (wsRef.current) wsRef.current.close(); // REFACTOR:
 
-      metaRef.current = {};
+      frameMetaBuffer.current = []; // REFACTOR:
       setDashboardData({
+        // REFACTOR:
         tracks: [],
-        counts: {},
-        fallAlert: false,
+        action_counts: {},
+        fall_alert: false,
         fps: 0,
-        frameIdx: 0,
+        frame_idx: 0,
       });
-      setStatus("running");
+      setStatus("running"); // REFACTOR:
 
-      const ws = new WebSocket(`${WS_BASE}/ws/${run_id}`);
-      ws.binaryType = "blob";
-      wsRef.current = ws;
+      const ws = new WebSocket(`${WS_BASE}/ws/${runId}`); // REFACTOR:
+      wsRef.current = ws; // REFACTOR:
 
-      ws.onmessage = (evt) => {
-        // PERF: Pass binary frame directly to VideoCanvas worker handler.
-        if (evt.data instanceof Blob) {
-          if (typeof handleFrame === "function") handleFrame(evt.data);
-          return;
-        }
-
-        let msg;
+      ws.onmessage = (event) => {
+        // REFACTOR:
+        // REFACTOR: all messages are JSON text now
         try {
-          msg = JSON.parse(evt.data);
-        } catch {
-          return;
-        }
+          const data = JSON.parse(event.data); // REFACTOR:
 
-        if (msg.type === "frame") {
-          // PERF: Keep latest metadata in ref; do not trigger rerender every frame.
-          metaRef.current = msg;
-          // PERF: Update dashboard state only every 6th frame.
-          if ((msg.frame_idx ?? 0) % 6 === 0) {
-            setDashboardData({
-              tracks: msg.tracks ?? [],
-              counts: msg.action_counts ?? {},
-              fallAlert: msg.fall_alert ?? false,
-              fps: msg.fps ?? 0,
-              frameIdx: msg.frame_idx ?? 0,
-            });
+          if (data.type === "ping") return; // REFACTOR: ignore keepalive packets
+
+          if (data.status) {
+            // REFACTOR: done / stopped / error
+            handleStatus(data.status); // REFACTOR:
+            return;
           }
-        } else if (msg.type === "status") {
-          setStatus(msg.status);
-          wsRef.current = null;
+
+          if (data.type && data.type !== "frame") return; // REFACTOR: ignore unknown non-frame payloads
+
+          frameMetaBuffer.current.push(data); // REFACTOR: buffer metadata by frame_idx
+          if (frameMetaBuffer.current.length > 1) {
+            const n = frameMetaBuffer.current.length; // REFACTOR:
+            if (
+              (frameMetaBuffer.current[n - 1].frame_idx ?? 0) <
+              (frameMetaBuffer.current[n - 2].frame_idx ?? 0)
+            ) {
+              frameMetaBuffer.current.sort(
+                (a, b) => (a.frame_idx ?? 0) - (b.frame_idx ?? 0),
+              );
+            }
+          }
+          if (frameMetaBuffer.current.length > META_BUFFER_LIMIT) {
+            frameMetaBuffer.current.splice(
+              0,
+              frameMetaBuffer.current.length - META_BUFFER_LIMIT,
+            ); // # FIX: evict oldest entries first when buffer exceeds 300
+          }
+
+          if ((data.frame_idx ?? 0) % 6 === 0) {
+            // REFACTOR: sparse dashboard updates
+            setDashboardData(data); // REFACTOR:
+          }
+        } catch (e) {
+          console.error("WS parse error", e); // REFACTOR:
         }
       };
 
       ws.onerror = () => {
-        setStatus("error");
-        wsRef.current = null;
+        // REFACTOR:
+        handleStatus("error"); // REFACTOR:
       };
 
       ws.onclose = () => {
-        if (wsRef.current) {
-          setStatus((prev) => (prev === "running" ? "error" : prev));
-          wsRef.current = null;
-        }
+        // REFACTOR:
+        if (wsRef.current) handleStatus("error"); // REFACTOR:
       };
     },
-    [handleFrame],
+    [handleStatus],
   );
 
-  useEffect(() => () => disconnect(), [disconnect]);
+  useEffect(() => () => disconnect(), [disconnect]); // REFACTOR:
 
-  return {
-    tracks: dashboardData.tracks,
-    counts: dashboardData.counts,
-    fallAlert: dashboardData.fallAlert,
-    status,
-    fps: dashboardData.fps,
-    frameIdx: dashboardData.frameIdx,
-    metaRef,
-    connect,
-    disconnect,
-  };
+  return { frameMetaBuffer, dashboardData, status, connect, disconnect }; // REFACTOR:
 }

@@ -1,4 +1,4 @@
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useState } from "react"; // REFACTOR: useCallback to stabilize callbacks
 import { useWebSocket } from "./hooks/useWebSocket";
 import VideoCanvas from "./components/VideoCanvas";
 import ControlPanel from "./components/ControlPanel";
@@ -8,37 +8,36 @@ import FallAlert from "./components/FallAlert";
 import HistoryList from "./components/HistoryList";
 
 function App() {
-  const frameHandlerRef = useRef(null);
-  const handleIncomingFrame = useCallback((blob) => {
-    // PERF: stable callback so websocket can stream frames without handler churn
-    if (frameHandlerRef.current) frameHandlerRef.current(blob);
-  }, []);
+  const { frameMetaBuffer, dashboardData, status, connect, disconnect } =
+    useWebSocket(); // REFACTOR:
+  const [runId, setRunId] = useState(null); // REFACTOR:
+  const [videoUrl, setVideoUrl] = useState(""); // REFACTOR:
 
-  const setCanvasFrameHandler = useCallback((fn) => {
-    // PERF: stable setter avoids recreating worker on each App render
-    frameHandlerRef.current = fn;
-  }, []);
+  const tracks = dashboardData.tracks ?? []; // REFACTOR:
+  const counts = dashboardData.action_counts ?? {}; // REFACTOR:
+  const fallAlert = dashboardData.fall_alert ?? false; // REFACTOR:
+  const fps = dashboardData.fps ?? 0; // REFACTOR:
+  const frameIdx = dashboardData.frame_idx ?? 0; // REFACTOR:
 
-  const {
-    tracks,
-    counts,
-    fallAlert,
-    status,
-    fps,
-    frameIdx,
-    connect,
-    disconnect,
-  } = useWebSocket(handleIncomingFrame);
-  const [runId, setRunId] = useState(null);
+  const handleStart = useCallback(
+    (id) => {
+      // REFACTOR: memoize callback to prevent ControlPanel re-creation on every App render
+      setRunId(id); // REFACTOR:
+      connect(id); // REFACTOR:
+    },
+    [connect],
+  ); // REFACTOR:
 
-  const handleStart = (id) => {
-    setRunId(id);
-    connect(id);
-  };
+  const handleStop = useCallback(() => {
+    // REFACTOR: memoize callback
+    disconnect(); // REFACTOR:
+  }, [disconnect]); // REFACTOR:
 
-  const handleStop = () => {
-    disconnect();
-  };
+  const handleVideoReady = useCallback((fileId) => {
+    // REFACTOR: memoize callback to prevent ControlPanel dependency churn
+    if (!fileId) return; // REFACTOR:
+    setVideoUrl(`/api/video/${fileId}`); // REFACTOR:
+  }, []); // REFACTOR: no deps, only sets state
 
   return (
     <div className="min-h-screen bg-slate-900 text-white flex flex-col">
@@ -65,6 +64,7 @@ function App() {
             status={status}
             onStart={handleStart}
             onStop={handleStop}
+            onVideoReady={handleVideoReady}
           />
         </aside>
 
@@ -72,9 +72,11 @@ function App() {
         <section className="flex-1 flex flex-col gap-3 p-4 min-w-0">
           <FallAlert active={fallAlert} />
           <VideoCanvas
-            isRunning={status === "running"}
-            setFrameHandler={setCanvasFrameHandler}
-          />
+            videoUrl={videoUrl}
+            frameMetaBuffer={frameMetaBuffer}
+            videoFps={30}
+          />{" "}
+          {/* REFACTOR: browser-native playback + canvas overlay */}
         </section>
 
         {/* Right — Analytics */}

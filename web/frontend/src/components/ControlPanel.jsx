@@ -8,7 +8,13 @@ import { uploadVideo, startRun, stopRun } from "../api/client";
  *   onStart(run_id): called when pipeline starts
  *   onStop(): called when stop clicked
  */
-export default function ControlPanel({ status, onStart, onStop }) {
+export default function ControlPanel({
+  status,
+  onStart,
+  onStop,
+  onVideoReady,
+}) {
+  // REFACTOR:
   const [file, setFile] = useState(null);
   const [fileId, setFileId] = useState(null);
   const [uploadProgress, setUploadProgress] = useState(0);
@@ -22,22 +28,28 @@ export default function ControlPanel({ status, onStart, onStop }) {
   const [uploading, setUploading] = useState(false);
   const dropRef = useRef(null);
 
-  const handleFile = useCallback(async (f) => {
-    if (!f) return;
-    setFile(f);
-    setFileId(null);
-    setUploadProgress(0);
-    setErrorMsg("");
-    setUploading(true);
-    try {
-      const result = await uploadVideo(f, setUploadProgress);
-      setFileId(result.file_id);
-    } catch (e) {
-      setErrorMsg("Upload failed: " + (e?.response?.data?.detail ?? e.message));
-    } finally {
-      setUploading(false);
-    }
-  }, []);
+  const handleFile = useCallback(
+    async (f) => {
+      if (!f) return;
+      setFile(f);
+      setFileId(null);
+      setUploadProgress(0);
+      setErrorMsg("");
+      setUploading(true);
+      try {
+        const result = await uploadVideo(f, setUploadProgress);
+        setFileId(result.file_id);
+        onVideoReady?.(result.file_id); // REFACTOR: provide browser-playable source URL seed to parent
+      } catch (e) {
+        setErrorMsg(
+          "Upload failed: " + (e?.response?.data?.detail ?? e.message),
+        );
+      } finally {
+        setUploading(false);
+      }
+    },
+    [onVideoReady],
+  ); // REFACTOR:
 
   const handleDrop = useCallback(
     (e) => {
