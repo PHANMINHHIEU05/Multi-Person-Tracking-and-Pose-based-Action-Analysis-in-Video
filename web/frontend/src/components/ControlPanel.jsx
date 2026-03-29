@@ -26,6 +26,7 @@ export default function ControlPanel({
   const [errorMsg, setErrorMsg] = useState("");
   const [runId, setRunId] = useState(null);
   const [uploading, setUploading] = useState(false);
+  const [autoStart, setAutoStart] = useState(false); // FIX: auto-start toggle
   const dropRef = useRef(null);
 
   const handleFile = useCallback(
@@ -40,6 +41,26 @@ export default function ControlPanel({
         const result = await uploadVideo(f, setUploadProgress);
         setFileId(result.file_id);
         onVideoReady?.(result.file_id); // REFACTOR: provide browser-playable source URL seed to parent
+        // FIX: auto-start if enabled
+        if (autoStart) {
+          setTimeout(async () => {
+            try {
+              const runResult = await startRun({
+                file_id: result.file_id,
+                model_path: modelPath,
+                conf,
+                imgsz,
+              });
+              setRunId(runResult.run_id);
+              onStart?.(runResult.run_id);
+            } catch (e) {
+              setErrorMsg(
+                "Auto-start failed: " +
+                  (e?.response?.data?.detail ?? e.message),
+              );
+            }
+          }, 500);
+        }
       } catch (e) {
         setErrorMsg(
           "Upload failed: " + (e?.response?.data?.detail ?? e.message),
@@ -48,7 +69,7 @@ export default function ControlPanel({
         setUploading(false);
       }
     },
-    [onVideoReady],
+    [onVideoReady, autoStart, modelPath, conf, imgsz, onStart],
   ); // REFACTOR:
 
   const handleDrop = useCallback(
@@ -191,6 +212,20 @@ export default function ControlPanel({
               </option>
             ))}
           </select>
+        </label>
+
+        <label className="flex items-center gap-2 cursor-pointer">
+          {" "}
+          {/* FIX: auto-start checkbox */}
+          <input
+            type="checkbox"
+            checked={autoStart}
+            onChange={(e) => setAutoStart(e.target.checked)}
+            className="w-4 h-4 accent-blue-500 cursor-pointer"
+          />
+          <span className="text-slate-400 select-none">
+            Auto-start after upload
+          </span>
         </label>
       </div>
 
