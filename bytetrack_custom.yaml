@@ -1,7 +1,7 @@
-tracker_type: bytetrack # FIX: custom ByteTrack profile for stable IDs
-track_high_thresh: 0.35 # FIX: lower high threshold to retain tracks through confidence dips
-track_low_thresh: 0.05 # FIX: allow low-score rescue matching
-new_track_thresh: 0.4 # FIX: reduce new-track gate to prevent frequent ID resets
-track_buffer: 60 # FIX: keep lost tracks alive longer for short occlusions
-match_thresh: 0.8 # FIX: preserve conservative association matching
-fuse_score: True # FIX: required by ultralytics ByteTrack get_dists() for score-IoU fusion
+tracker_type: bytetrack # FIX:
+track_high_thresh: 0.25 # FIX:
+track_low_thresh: 0.05 # FIX:
+new_track_thresh: 0.3 # FIX:
+track_buffer: 90 # FIX:
+match_thresh: 0.7 # FIX:
+fuse_score: True # FIX: required by current ultralytics ByteTrack implementation
