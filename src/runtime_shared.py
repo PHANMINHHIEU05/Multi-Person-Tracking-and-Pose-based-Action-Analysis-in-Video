@@ -44,12 +44,39 @@ L_ANKLE, R_ANKLE = 15, 16
 L_SHOULDER, R_SHOULDER = 5, 6
 
 
+def resolve_default_pose_weights_path() -> str:
+    engine_path = ROOT / "yolov8n-pose.engine"
+    if engine_path.exists():
+        return str(engine_path)
+    return str(ROOT / "yolov8n-pose.pt")
+
+
+def describe_pose_runtime(weights_path: str) -> Dict[str, str]:
+    suffix = Path(weights_path).suffix.lower()
+    if suffix == ".engine":
+        backend = "TensorRT"
+        device = "cuda" if torch.cuda.is_available() else "missing-cuda"
+    else:
+        backend = "PyTorch"
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    return {
+        "backend": backend,
+        "device": device,
+        "weights_path": str(weights_path),
+    }
+
+
 def load_pose_model(weights_path: str) -> YOLO:
+    runtime_info = describe_pose_runtime(weights_path)
+    if runtime_info["backend"] == "TensorRT" and runtime_info["device"] != "cuda":
+        raise RuntimeError("TensorRT pose engine requires CUDA. Please use a `.pt` pose model or enable NVIDIA CUDA/TensorRT.")
+
     model = YOLO(weights_path)
-    if torch.cuda.is_available():
+    if runtime_info["backend"] == "PyTorch" and runtime_info["device"] == "cuda":
         model.to("cuda")
     warmup = np.zeros((640, 640, 3), dtype=np.uint8)
     model.predict(warmup, verbose=False)
+    model._codex_runtime_info = runtime_info
     return model
 
 

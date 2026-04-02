@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import threading
 import time
 from collections import defaultdict
 from dataclasses import dataclass
@@ -11,8 +12,8 @@ from typing import Optional, Tuple
 import cv2
 import numpy as np
 import torch
-from PyQt6.QtCore import QThread, Qt, pyqtSignal
-from PyQt6.QtGui import QImage, QPixmap
+from PyQt6.QtCore import QThread, Qt, QTimer, QUrl, pyqtSignal
+from PyQt6.QtGui import QCloseEvent, QDesktopServices, QImage, QPixmap
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -31,6 +32,7 @@ from PyQt6.QtWidgets import (
     QScrollArea,
     QSpinBox,
     QSplitter,
+    QTextBrowser,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -41,6 +43,7 @@ from src.runtime_shared import (
     LABEL_COLORS,
     LABEL_MAP,
     ROOT,
+    describe_pose_runtime,
     bbox_center_distance_norm,
     bbox_iou_xyxy,
     draw_action_label,
@@ -48,6 +51,7 @@ from src.runtime_shared import (
     extract_kpts_for_track,
     load_pose_model,
     resolve_default_action_model_path,
+    resolve_default_pose_weights_path,
     resolve_tracker_config,
 )
 
@@ -55,6 +59,8 @@ OUTPUT_DIR = ROOT / "runs" / "qt_outputs"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 _POSE_MODEL_CACHE = {}
+DEFAULT_PREVIEW_WIDTH = 960
+DEFAULT_PREVIEW_HEIGHT = 540
 
 
 def load_pose_model_qt(weights_path: str):
@@ -65,7 +71,16 @@ def load_pose_model_qt(weights_path: str):
     return model
 
 
-def frame_to_qimage(frame_bgr: np.ndarray) -> QImage:
+def frame_to_qimage(frame_bgr: np.ndarray, target_size: Optional[Tuple[int, int]] = None) -> QImage:
+    if target_size is not None:
+        target_w = max(1, int(target_size[0]))
+        target_h = max(1, int(target_size[1]))
+        src_h, src_w = frame_bgr.shape[:2]
+        scale = min(target_w / max(src_w, 1), target_h / max(src_h, 1), 1.0)
+        if scale < 0.999:
+            resized_w = max(1, int(round(src_w * scale)))
+            resized_h = max(1, int(round(src_h * scale)))
+            frame_bgr = cv2.resize(frame_bgr, (resized_w, resized_h), interpolation=cv2.INTER_AREA)
     rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
     h, w, ch = rgb.shape
     image = QImage(rgb.data, w, h, ch * w, QImage.Format.Format_RGB888)
@@ -86,11 +101,16 @@ class RuntimeConfig:
     max_det: int
     draw_skeleton: bool
     live_preview: bool
+    preview_width: int
+    preview_height: int
+    webcam_duration_sec: int
     preview_stride: int
     process_stride: int
     output_scale: float
+    save_output_video: bool
     skip_action_model: bool
     normalize_timing: bool
+    auto_tune_cpu: bool
     target_analysis_fps: float
     min_track_frames: int
     pred_stride: int
@@ -101,7 +121,7 @@ class RuntimeConfig:
 
 
 class InferenceWorker(QThread):
-    frame_ready = pyqtSignal(object)
+    frame_ready = pyqtSignal()
     metrics_ready = pyqtSignal(dict)
     status_ready = pyqtSignal(str)
     finished_ready = pyqtSignal(dict)
@@ -111,9 +131,29 @@ class InferenceWorker(QThread):
         super().__init__()
         self.config = config
         self._stop_requested = False
+        self._preview_lock = threading.Lock()
+        self._latest_preview_image: Optional[QImage] = None
+        self._preview_signal_pending = False
 
     def stop(self) -> None:
         self._stop_requested = True
+
+    def _store_latest_preview(self, image: QImage) -> None:
+        should_emit = False
+        with self._preview_lock:
+            self._latest_preview_image = image
+            if not self._preview_signal_pending:
+                self._preview_signal_pending = True
+                should_emit = True
+        if should_emit:
+            self.frame_ready.emit()
+
+    def take_latest_preview(self) -> Optional[QImage]:
+        with self._preview_lock:
+            image = self._latest_preview_image
+            self._latest_preview_image = None
+            self._preview_signal_pending = False
+        return image
 
     def _build_recognizer(self) -> Optional[ActionRecognizerLite]:
         if self.config.skip_action_model:
@@ -143,15 +183,22 @@ class InferenceWorker(QThread):
                 raise FileNotFoundError(f"Video not found: {cfg.video_path}")
             cap = cv2.VideoCapture(cfg.video_path)
             output_stem = Path(cfg.video_path).stem
+            max_frames = None
         else:
             cap = cv2.VideoCapture(int(cfg.camera_index))
             output_stem = f"webcam_{cfg.camera_index}"
+            approx_fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+            max_frames = int(max(1, cfg.webcam_duration_sec) * max(1.0, approx_fps))
 
         if not cap.isOpened():
             raise RuntimeError("Cannot open selected input source.")
 
         self.status_ready.emit("Loading pose model...")
         pose_model = load_pose_model_qt(cfg.pose_weights)
+        pose_runtime = getattr(pose_model, "_codex_runtime_info", describe_pose_runtime(cfg.pose_weights))
+        self.status_ready.emit(
+            f"Pose runtime: {pose_runtime.get('backend', 'unknown')} on {pose_runtime.get('device', 'unknown')}"
+        )
 
         self.status_ready.emit("Loading action model...")
         recognizer = self._build_recognizer()
@@ -161,11 +208,27 @@ class InferenceWorker(QThread):
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
         w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
         h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+        cpu_only = not torch.cuda.is_available()
 
         effective_process_stride = max(1, cfg.process_stride)
         effective_preview_stride = max(1, cfg.preview_stride)
         effective_max_det = max(1, cfg.max_det)
         effective_target_analysis_fps = max(0.0, cfg.target_analysis_fps)
+        cpu_auto_tuned = False
+        if cfg.auto_tune_cpu and cpu_only and effective_process_stride < 2:
+            effective_process_stride = 2
+            cpu_auto_tuned = True
+        if cfg.auto_tune_cpu and cpu_only and cfg.source_mode == "video" and effective_process_stride < 3:
+            effective_process_stride = 3
+            cpu_auto_tuned = True
+        if cfg.auto_tune_cpu and cpu_only and cfg.live_preview and effective_preview_stride < 4:
+            effective_preview_stride = 4
+            cpu_auto_tuned = True
+        if not cfg.live_preview and effective_preview_stride < 10:
+            effective_preview_stride = 10
+        if cfg.auto_tune_cpu and cpu_only and effective_max_det > 20:
+            effective_max_det = 20
+            cpu_auto_tuned = True
         if cfg.normalize_timing and effective_target_analysis_fps > 0 and fps_src > effective_target_analysis_fps:
             effective_process_stride = max(
                 effective_process_stride,
@@ -174,31 +237,49 @@ class InferenceWorker(QThread):
 
         effective_action_update_stride = 1
         action_backend = None
+        action_fast_mode = False
+        effective_action_pred_stride = None
         if recognizer is not None:
             action_backend = getattr(recognizer, "backend", "unknown")
+            if action_backend == "extratrees":
+                action_fast_mode = bool(cfg.auto_tune_cpu and cpu_only and cfg.source_mode == "video")
+                recognizer.fast_mode = action_fast_mode
             if action_backend == "torch":
                 effective_action_update_stride = 2 if cfg.source_mode == "webcam" else 3
             else:
                 effective_action_update_stride = 1 if cfg.source_mode == "webcam" else 2
+            current_pred_stride = int(getattr(recognizer, "pred_stride", 1))
+            if cfg.auto_tune_cpu and cpu_only:
+                if action_backend == "torch":
+                    min_pred_stride = 6 if cfg.source_mode == "video" else 4
+                else:
+                    min_pred_stride = 4 if cfg.source_mode == "video" else 2
+                if current_pred_stride < min_pred_stride:
+                    recognizer.pred_stride = min_pred_stride
+                    current_pred_stride = min_pred_stride
+                    cpu_auto_tuned = True
+            effective_action_pred_stride = current_pred_stride
             if cfg.normalize_timing and fps_src > 0:
                 target_action_fps = 8.0 if action_backend == "torch" else 10.0
                 effective_action_update_stride = max(
                     effective_action_update_stride,
                     int(round(fps_src / target_action_fps)),
                 )
+            if cfg.auto_tune_cpu and cpu_only and cfg.source_mode == "video":
+                effective_action_update_stride = max(effective_action_update_stride, 3)
 
         output_w = max(1, int(w * cfg.output_scale))
         output_h = max(1, int(h * cfg.output_scale))
 
         output_path = None
         writer = None
-        if cfg.source_mode == "video" and w > 0 and h > 0:
+        if cfg.source_mode == "video" and cfg.save_output_video and w > 0 and h > 0:
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
             output_path = OUTPUT_DIR / f"{output_stem}_{ts}_qt_annotated.mp4"
             preferred_mp4 = output_path
             fallback_avi = output_path.with_suffix(".avi")
             for candidate_path, codecs in [
-                (preferred_mp4, ("avc1", "mp4v")),
+                (preferred_mp4, ("mp4v", "avc1")),
                 (fallback_avi, ("XVID", "MJPG")),
             ]:
                 for codec_name in codecs:
@@ -211,6 +292,9 @@ class InferenceWorker(QThread):
                     candidate_writer.release()
                 if writer is not None:
                     break
+            if writer is None:
+                output_path = None
+                self.status_ready.emit("Annotated video writer unavailable on this system. Continuing without saving output.")
 
         frame_idx = 0
         t_prev = time.time()
@@ -269,13 +353,16 @@ class InferenceWorker(QThread):
             ok, frame = cap.read()
             if not ok:
                 break
+            if max_frames is not None and frame_idx >= max_frames:
+                break
 
             detection_stats["frames_processed"] += 1
             visible_ids: set[int] = set()
             recognizer_active_ids: set[int] = set()
-            should_draw_this_frame = (writer is not None) or (cfg.live_preview and frame_idx % effective_preview_stride == 0)
             should_process_frame = frame_idx % effective_process_stride == 0
             action_update_due = frame_idx % max(1, effective_action_update_stride) == 0
+            preview_emit_due = cfg.live_preview
+            should_draw_this_frame = (writer is not None) or cfg.live_preview
 
             if should_process_frame:
                 assigned_stable_ids: set[int] = set()
@@ -383,8 +470,10 @@ class InferenceWorker(QThread):
             fps_ema = 0.92 * fps_ema + 0.08 * (1.0 / max(now - t_prev, 1e-6))
             t_prev = now
 
-            if cfg.live_preview and frame_idx % effective_preview_stride == 0:
-                self.frame_ready.emit(frame_to_qimage(frame))
+            if cfg.live_preview and preview_emit_due:
+                self._store_latest_preview(
+                    frame_to_qimage(frame, target_size=(cfg.preview_width, cfg.preview_height))
+                )
 
             if frame_idx % max(1, effective_preview_stride) == 0:
                 self.metrics_ready.emit(
@@ -396,9 +485,13 @@ class InferenceWorker(QThread):
                         "falls": action_counts.get("Fall", 0),
                         "source_fps": fps_src,
                         "effective_process_stride": effective_process_stride,
+                        "effective_preview_stride": effective_preview_stride,
                         "effective_action_update_stride": effective_action_update_stride,
+                        "effective_action_pred_stride": effective_action_pred_stride or 0,
+                        "effective_max_det": effective_max_det,
+                        "cpu_auto_tuned": cpu_auto_tuned,
                         "processed_frames": detection_stats["frames_processed"],
-                        "total_frames": total_frames,
+                        "total_frames": total_frames or max_frames or 0,
                     }
                 )
 
@@ -420,10 +513,18 @@ class InferenceWorker(QThread):
             "fps_live_ema": fps_ema,
             "elapsed_sec": elapsed,
             "source_fps": fps_src,
+            "effective_preview_stride": effective_preview_stride,
+            "effective_max_det": effective_max_det,
+            "effective_action_pred_stride": effective_action_pred_stride,
             "effective_process_stride": effective_process_stride,
             "effective_action_update_stride": effective_action_update_stride,
             "effective_target_analysis_fps": effective_target_analysis_fps,
+            "pose_backend": pose_runtime.get("backend"),
+            "pose_device": pose_runtime.get("device"),
+            "pose_weights": pose_runtime.get("weights_path"),
             "action_backend": action_backend,
+            "action_fast_mode": action_fast_mode,
+            "cpu_auto_tuned": cpu_auto_tuned,
             "output_path": str(output_path) if output_path else None,
             "stopped": self._stop_requested,
             "action_counts": dict(action_counts),
@@ -434,10 +535,12 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.worker: Optional[InferenceWorker] = None
+        self.last_output_path: Optional[str] = None
         self.setWindowTitle("PyQt6 Fall Detection & Action Recognition")
         self.resize(1560, 920)
         self._build_ui()
         self._sync_source_mode()
+        self._sync_normalize_timing()
 
     def _build_ui(self) -> None:
         splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -466,10 +569,15 @@ class MainWindow(QMainWindow):
         self.camera_index_spin = QSpinBox()
         self.camera_index_spin.setRange(0, 8)
         self.camera_index_spin.setValue(0)
+        self.webcam_duration_spin = QSpinBox()
+        self.webcam_duration_spin.setRange(3, 300)
+        self.webcam_duration_spin.setValue(10)
         self.camera_row_widget = QWidget()
         camera_row = QHBoxLayout()
         camera_row.setContentsMargins(0, 0, 0, 0)
         camera_row.addWidget(self.camera_index_spin)
+        camera_row.addWidget(QLabel("Duration (sec)"))
+        camera_row.addWidget(self.webcam_duration_spin)
         self.camera_row_widget.setLayout(camera_row)
 
         source_group = QGroupBox("Input")
@@ -479,7 +587,7 @@ class MainWindow(QMainWindow):
         source_form.addRow("Camera Index", self.camera_row_widget)
         control_layout.addWidget(source_group)
 
-        self.pose_weights_edit = QLineEdit(str(ROOT / "yolov8n-pose.pt"))
+        self.pose_weights_edit = QLineEdit(resolve_default_pose_weights_path())
         self.action_model_edit = QLineEdit(resolve_default_action_model_path())
         self.tracker_combo = QComboBox()
         self.tracker_combo.addItems(["BoT-SORT (custom)", "ByteTrack (custom)", "BoT-SORT (default)", "ByteTrack (default)"])
@@ -512,6 +620,9 @@ class MainWindow(QMainWindow):
         self.skip_action_checkbox = QCheckBox("Skip action recognition model")
         self.normalize_timing_checkbox = QCheckBox("Normalize timing across videos")
         self.normalize_timing_checkbox.setChecked(True)
+        self.normalize_timing_checkbox.toggled.connect(self._sync_normalize_timing)
+        self.auto_tune_cpu_checkbox = QCheckBox("CPU auto-tune")
+        self.auto_tune_cpu_checkbox.setChecked(True)
         self.process_stride_spin = QSpinBox()
         self.process_stride_spin.setRange(1, 5)
         self.process_stride_spin.setValue(1)
@@ -522,6 +633,8 @@ class MainWindow(QMainWindow):
         for value in [0.5, 0.75, 1.0]:
             self.output_scale_combo.addItem(str(value), value)
         self.output_scale_combo.setCurrentText("1.0")
+        self.save_output_checkbox = QCheckBox("Save annotated output video")
+        self.save_output_checkbox.setChecked(False)
         self.target_analysis_fps_spin = self._make_double_spin(6.0, 20.0, 12.0, 1.0)
 
         perf_group = QGroupBox("Performance")
@@ -530,9 +643,11 @@ class MainWindow(QMainWindow):
         perf_form.addRow(self.draw_skeleton_checkbox)
         perf_form.addRow(self.skip_action_checkbox)
         perf_form.addRow(self.normalize_timing_checkbox)
+        perf_form.addRow(self.auto_tune_cpu_checkbox)
         perf_form.addRow("Process Stride", self.process_stride_spin)
         perf_form.addRow("Preview Stride", self.preview_stride_spin)
         perf_form.addRow("Output Scale", self.output_scale_combo)
+        perf_form.addRow(self.save_output_checkbox)
         perf_form.addRow("Target Analysis FPS", self.target_analysis_fps_spin)
         control_layout.addWidget(perf_group)
 
@@ -559,14 +674,31 @@ class MainWindow(QMainWindow):
         action_form.addRow("Sitting Strictness", self.sitting_conf_penalty_spin)
         control_layout.addWidget(action_group)
 
+        preset_group = QGroupBox("Profiles")
+        preset_row = QHBoxLayout(preset_group)
+        balanced_btn = QPushButton("RTX 3050 Balanced")
+        fast_btn = QPushButton("Fast Mode")
+        quality_btn = QPushButton("Quality Mode")
+        balanced_btn.clicked.connect(lambda: self._apply_profile("balanced"))
+        fast_btn.clicked.connect(lambda: self._apply_profile("fast"))
+        quality_btn.clicked.connect(lambda: self._apply_profile("quality"))
+        preset_row.addWidget(balanced_btn)
+        preset_row.addWidget(fast_btn)
+        preset_row.addWidget(quality_btn)
+        control_layout.addWidget(preset_group)
+
         button_row = QHBoxLayout()
         self.start_btn = QPushButton("Start")
         self.stop_btn = QPushButton("Stop")
+        self.open_output_btn = QPushButton("Open Output")
         self.stop_btn.setEnabled(False)
+        self.open_output_btn.setEnabled(False)
         self.start_btn.clicked.connect(self._start_run)
         self.stop_btn.clicked.connect(self._stop_run)
+        self.open_output_btn.clicked.connect(self._open_output)
         button_row.addWidget(self.start_btn)
         button_row.addWidget(self.stop_btn)
+        button_row.addWidget(self.open_output_btn)
         control_layout.addLayout(button_row)
 
         right_panel = QWidget()
@@ -589,6 +721,9 @@ class MainWindow(QMainWindow):
             ("falls", "Falls"),
             ("source_fps", "Source FPS"),
             ("effective_process_stride", "Process Stride"),
+            ("effective_preview_stride", "Preview Stride"),
+            ("effective_max_det", "Effective MaxDet"),
+            ("effective_action_pred_stride", "Action Pred Stride"),
             ("effective_action_update_stride", "Action Update Stride"),
         ]
         for index, (key, title) in enumerate(metric_names):
@@ -599,6 +734,11 @@ class MainWindow(QMainWindow):
             metrics_layout.addWidget(value_label, index // 2, (index % 2) * 2 + 1)
             self.metric_labels[key] = value_label
         right_layout.addWidget(metrics_group, stretch=1)
+
+        self.summary_browser = QTextBrowser()
+        self.summary_browser.setOpenExternalLinks(False)
+        self.summary_browser.setPlaceholderText("Run summary will appear here.")
+        right_layout.addWidget(self.summary_browser, stretch=2)
 
         self.log_output = QTextEdit()
         self.log_output.setReadOnly(True)
@@ -620,6 +760,10 @@ class MainWindow(QMainWindow):
         is_video = self.source_combo.currentText() == "Upload Video"
         self.video_row_widget.setVisible(is_video)
         self.camera_row_widget.setVisible(not is_video)
+        self.save_output_checkbox.setEnabled(is_video)
+
+    def _sync_normalize_timing(self) -> None:
+        self.target_analysis_fps_spin.setEnabled(self.normalize_timing_checkbox.isChecked())
 
     def _browse_video(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
@@ -645,11 +789,16 @@ class MainWindow(QMainWindow):
             max_det=int(self.max_det_spin.value()),
             draw_skeleton=self.draw_skeleton_checkbox.isChecked(),
             live_preview=self.live_preview_checkbox.isChecked(),
+            preview_width=max(self.preview_label.width(), self.preview_label.minimumWidth(), DEFAULT_PREVIEW_WIDTH),
+            preview_height=max(self.preview_label.height(), self.preview_label.minimumHeight(), DEFAULT_PREVIEW_HEIGHT),
+            webcam_duration_sec=int(self.webcam_duration_spin.value()),
             preview_stride=int(self.preview_stride_spin.value()),
             process_stride=int(self.process_stride_spin.value()),
             output_scale=float(self.output_scale_combo.currentData()),
+            save_output_video=self.save_output_checkbox.isChecked(),
             skip_action_model=self.skip_action_checkbox.isChecked(),
             normalize_timing=self.normalize_timing_checkbox.isChecked(),
+            auto_tune_cpu=self.auto_tune_cpu_checkbox.isChecked(),
             target_analysis_fps=float(self.target_analysis_fps_spin.value()),
             min_track_frames=int(self.min_track_frames_spin.value()),
             pred_stride=int(self.pred_stride_spin.value()),
@@ -662,6 +811,73 @@ class MainWindow(QMainWindow):
     def _set_running(self, running: bool) -> None:
         self.start_btn.setEnabled(not running)
         self.stop_btn.setEnabled(running)
+        if running:
+            self.open_output_btn.setEnabled(False)
+
+    def _apply_profile(self, profile_name: str) -> None:
+        if profile_name == "balanced":
+            self.tracker_combo.setCurrentText("BoT-SORT (custom)")
+            self.det_conf_spin.setValue(0.30)
+            self.det_iou_spin.setValue(0.50)
+            self.imgsz_combo.setCurrentText("640")
+            self.max_det_spin.setValue(12)
+            self.live_preview_checkbox.setChecked(True)
+            self.process_stride_spin.setValue(1)
+            self.preview_stride_spin.setValue(4)
+            self.output_scale_combo.setCurrentText("1.0")
+            self.save_output_checkbox.setChecked(False)
+            self.normalize_timing_checkbox.setChecked(True)
+            self.target_analysis_fps_spin.setValue(12.0)
+            self.pred_stride_spin.setValue(3)
+            self.action_conf_spin.setValue(0.30)
+            self.smooth_window_spin.setValue(3)
+            self.fall_conf_boost_spin.setValue(0.10)
+            self.sitting_conf_penalty_spin.setValue(0.20)
+        elif profile_name == "fast":
+            self.tracker_combo.setCurrentText("ByteTrack (custom)")
+            self.det_conf_spin.setValue(0.28)
+            self.det_iou_spin.setValue(0.45)
+            self.imgsz_combo.setCurrentText("480")
+            self.max_det_spin.setValue(20)
+            self.live_preview_checkbox.setChecked(True)
+            self.process_stride_spin.setValue(2)
+            self.preview_stride_spin.setValue(5)
+            self.output_scale_combo.setCurrentText("0.75")
+            self.save_output_checkbox.setChecked(False)
+            self.normalize_timing_checkbox.setChecked(True)
+            self.target_analysis_fps_spin.setValue(10.0)
+            self.pred_stride_spin.setValue(4)
+            self.action_conf_spin.setValue(0.30)
+            self.smooth_window_spin.setValue(3)
+            self.fall_conf_boost_spin.setValue(0.10)
+            self.sitting_conf_penalty_spin.setValue(0.20)
+        else:
+            self.tracker_combo.setCurrentText("BoT-SORT (custom)")
+            self.det_conf_spin.setValue(0.30)
+            self.det_iou_spin.setValue(0.50)
+            self.imgsz_combo.setCurrentText("960")
+            self.max_det_spin.setValue(100)
+            self.live_preview_checkbox.setChecked(True)
+            self.process_stride_spin.setValue(1)
+            self.preview_stride_spin.setValue(2)
+            self.output_scale_combo.setCurrentText("1.0")
+            self.save_output_checkbox.setChecked(True)
+            self.normalize_timing_checkbox.setChecked(False)
+            self.target_analysis_fps_spin.setValue(12.0)
+            self.pred_stride_spin.setValue(1)
+            self.action_conf_spin.setValue(0.30)
+            self.smooth_window_spin.setValue(3)
+            self.fall_conf_boost_spin.setValue(0.10)
+            self.sitting_conf_penalty_spin.setValue(0.20)
+        self.auto_tune_cpu_checkbox.setChecked(True)
+        self._append_log(f"Applied profile: {profile_name}")
+
+    def _open_output(self) -> None:
+        if not self.last_output_path:
+            return
+        output_path = Path(self.last_output_path)
+        target = output_path if output_path.exists() else output_path.parent
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(target)))
 
     def _start_run(self) -> None:
         if self.worker is not None and self.worker.isRunning():
@@ -677,14 +893,17 @@ class MainWindow(QMainWindow):
 
         self.preview_label.setText("Starting...")
         self.log_output.clear()
+        self.summary_browser.clear()
+        self.last_output_path = None
         self._append_log("PyQt6 desktop run started.")
 
         self.worker = InferenceWorker(config)
-        self.worker.frame_ready.connect(self._update_frame)
+        self.worker.frame_ready.connect(self._flush_preview_frame)
         self.worker.metrics_ready.connect(self._update_metrics)
         self.worker.status_ready.connect(self._append_log)
         self.worker.finished_ready.connect(self._on_finished)
         self.worker.error_ready.connect(self._on_error)
+        self.worker.finished.connect(self._cleanup_worker)
         self._set_running(True)
         self.worker.start()
 
@@ -700,9 +919,18 @@ class MainWindow(QMainWindow):
         scaled = pixmap.scaled(
             self.preview_label.size(),
             Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation,
+            Qt.TransformationMode.FastTransformation,
         )
         self.preview_label.setPixmap(scaled)
+
+    def _flush_preview_frame(self) -> None:
+        worker = self.worker
+        if worker is None:
+            return
+        image = worker.take_latest_preview()
+        if image is None:
+            return
+        self._update_frame(image)
 
     def _update_metrics(self, metrics: dict) -> None:
         for key, value in metrics.items():
@@ -719,14 +947,44 @@ class MainWindow(QMainWindow):
 
     def _on_finished(self, summary: dict) -> None:
         self._set_running(False)
-        self.worker = None
         self._append_log("Run finished.")
+        self.last_output_path = summary.get("output_path")
+        self.open_output_btn.setEnabled(bool(self.last_output_path))
         if summary.get("output_path"):
             self._append_log(f"Output video: {summary['output_path']}")
         self._append_log(
             f"FPS={summary.get('fps', 0):.1f} | "
             f"Unique Track IDs={summary.get('unique_track_ids', 0)} | "
             f"Source FPS={summary.get('source_fps', 0):.1f}"
+        )
+        action_lines = []
+        for action, count in sorted(summary.get("action_counts", {}).items(), key=lambda item: item[1], reverse=True):
+            action_lines.append(f"<li><b>{action}</b>: {count}</li>")
+        action_html = "<ul>" + "".join(action_lines) + "</ul>" if action_lines else "<p>No actions detected.</p>"
+        self.summary_browser.setHtml(
+            f"""
+            <h3>Run Summary</h3>
+            <p><b>Average FPS:</b> {summary.get('fps', 0):.1f}<br>
+            <b>Live FPS EMA:</b> {summary.get('fps_live_ema', 0):.1f}<br>
+            <b>Unique Track IDs:</b> {summary.get('unique_track_ids', 0)}<br>
+            <b>Total Detections:</b> {summary.get('total_detections', 0)}<br>
+            <b>Frames With Detections:</b> {summary.get('frames_with_detections', 0)}<br>
+            <b>Source FPS:</b> {summary.get('source_fps', 0):.1f}<br>
+            <b>Effective Process Stride:</b> {summary.get('effective_process_stride', 0)}<br>
+            <b>Effective Preview Stride:</b> {summary.get('effective_preview_stride', 0)}<br>
+            <b>Effective Action Pred Stride:</b> {summary.get('effective_action_pred_stride', 0) or 0}<br>
+            <b>Effective Action Update Stride:</b> {summary.get('effective_action_update_stride', 0)}<br>
+            <b>Effective MaxDet:</b> {summary.get('effective_max_det', 0)}<br>
+            <b>CPU Auto-Tuned:</b> {summary.get('cpu_auto_tuned', False)}<br>
+            <b>Pose Backend:</b> {summary.get('pose_backend') or 'unknown'}<br>
+            <b>Pose Device:</b> {summary.get('pose_device') or 'unknown'}<br>
+            <b>Pose Weights:</b> {summary.get('pose_weights') or 'unknown'}<br>
+            <b>Action Backend:</b> {summary.get('action_backend') or 'disabled'}<br>
+            <b>Action Fast Mode:</b> {summary.get('action_fast_mode', False)}<br>
+            <b>Output:</b> {summary.get('output_path') or 'No file saved'}</p>
+            <h4>Action Counts</h4>
+            {action_html}
+            """
         )
         QMessageBox.information(
             self,
@@ -739,9 +997,34 @@ class MainWindow(QMainWindow):
 
     def _on_error(self, message: str) -> None:
         self._set_running(False)
-        self.worker = None
+        self.open_output_btn.setEnabled(bool(self.last_output_path))
         self._append_log(f"ERROR: {message}")
         QMessageBox.critical(self, "PyQt6 App Error", message)
+
+    def _cleanup_worker(self) -> None:
+        worker = self.worker
+        if worker is None:
+            return
+        if worker.isRunning():
+            QTimer.singleShot(50, self._cleanup_worker)
+            return
+        worker.deleteLater()
+        self.worker = None
+
+    def closeEvent(self, event: QCloseEvent) -> None:
+        worker = self.worker
+        if worker is not None and worker.isRunning():
+            self._append_log("Waiting for background worker to stop before closing...")
+            worker.stop()
+            if not worker.wait(10000):
+                QMessageBox.warning(
+                    self,
+                    "Processing In Progress",
+                    "The background inference thread is still shutting down. Please wait a moment and try closing again.",
+                )
+                event.ignore()
+                return
+        super().closeEvent(event)
 
 
 def main() -> None:
