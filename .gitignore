@@ -140,6 +140,7 @@ dmypy.json
 *.ckpt
 *.pb
 *.onnx
+*.engine
 *.tflite
 *.weights
 *.pkl
@@ -165,6 +166,11 @@ images/
 output/
 results/
 runs/
+.uv-python/
+.uv-cache/
+.trt-export-venv/
+.pip-cache/
+.tmp-build/
 
 # Logs and outputs
 logs/

@@ -22,9 +22,16 @@ The system is built as a modular computer vision pipeline combining YOLOv8, BoT-
 pip install -r requirements.txt
 
 # Launch the primary PyQt6 desktop UI
+source .trt-export-venv/bin/activate
+python pyqt_app.py
+
+# Fallback runtime without TensorRT
+source .venv/bin/activate
 python pyqt_app.py
 
 # Optional: export TensorRT pose engine on an NVIDIA RTX machine
+# Uses the dedicated Python 3.12 TensorRT export environment created for this project.
+source .trt-export-venv/bin/activate
 python export_pose_engine.py
 
 # Run full pipeline (action recognition) on a video
@@ -61,7 +68,8 @@ Current PyQt6 UI includes:
 - Tracking/detection/runtime controls
 - Annotated output video saving for uploaded videos
 
-If `yolov8n-pose.engine` exists in the project root, the PyQt6 app now auto-prefers it over `yolov8n-pose.pt`.
+If `yolov8n-pose.engine` exists in the project root, the PyQt6 app auto-prefers it when the current Python environment has TensorRT available.
+If TensorRT is not available in the current environment, the app falls back to `yolov8n-pose.pt`.
 
 ---
 

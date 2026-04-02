@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter, deque
+import importlib.util
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
@@ -46,7 +47,7 @@ L_SHOULDER, R_SHOULDER = 5, 6
 
 def resolve_default_pose_weights_path() -> str:
     engine_path = ROOT / "yolov8n-pose.engine"
-    if engine_path.exists():
+    if engine_path.exists() and importlib.util.find_spec("tensorrt") is not None:
         return str(engine_path)
     return str(ROOT / "yolov8n-pose.pt")
 
@@ -55,7 +56,10 @@ def describe_pose_runtime(weights_path: str) -> Dict[str, str]:
     suffix = Path(weights_path).suffix.lower()
     if suffix == ".engine":
         backend = "TensorRT"
-        device = "cuda" if torch.cuda.is_available() else "missing-cuda"
+        if importlib.util.find_spec("tensorrt") is None:
+            device = "missing-tensorrt"
+        else:
+            device = "cuda" if torch.cuda.is_available() else "missing-cuda"
     else:
         backend = "PyTorch"
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -68,6 +72,11 @@ def describe_pose_runtime(weights_path: str) -> Dict[str, str]:
 
 def load_pose_model(weights_path: str) -> YOLO:
     runtime_info = describe_pose_runtime(weights_path)
+    if runtime_info["backend"] == "TensorRT" and runtime_info["device"] == "missing-tensorrt":
+        raise RuntimeError(
+            "TensorRT pose engine selected but the current Python environment does not have TensorRT bindings. "
+            "Run the PyQt6 app from the dedicated TensorRT environment or switch back to the `.pt` pose model."
+        )
     if runtime_info["backend"] == "TensorRT" and runtime_info["device"] != "cuda":
         raise RuntimeError("TensorRT pose engine requires CUDA. Please use a `.pt` pose model or enable NVIDIA CUDA/TensorRT.")
 

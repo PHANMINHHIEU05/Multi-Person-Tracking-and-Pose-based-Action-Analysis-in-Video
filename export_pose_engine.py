@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import shutil
+import sys
 from pathlib import Path
 
 import torch
 from ultralytics import YOLO
 
-from src.runtime_shared import ROOT
+ROOT = Path(__file__).resolve().parent
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -75,6 +77,34 @@ def main() -> None:
         raise SystemExit(f"Pose weights not found: {weights_path}")
     if not torch.cuda.is_available():
         raise SystemExit("CUDA is required to export a TensorRT engine.")
+
+    missing_packages = []
+    dependency_checks = [
+        ("onnx", "onnx<2.0.0"),
+        ("onnxslim", "onnxslim>=0.1.71"),
+        ("tensorrt", "tensorrt-cu12>=7.0.0"),
+    ]
+    for module_name, package_name in dependency_checks:
+        if importlib.util.find_spec(module_name) is None:
+            missing_packages.append(package_name)
+    if missing_packages:
+        missing_str = " ".join(missing_packages)
+        compatibility_hint = ""
+        if importlib.util.find_spec("tensorrt") is None and sys.version_info >= (3, 13):
+            compatibility_hint = (
+                f"\nCurrent project virtualenv uses Python {sys.version_info.major}.{sys.version_info.minor}. "
+                "If `tensorrt-cu12` does not install cleanly here, rerun this export from a dedicated "
+                "RTX export environment that uses a TensorRT-friendly Python version "
+                "(commonly 3.10-3.12), then copy the generated `yolov8n-pose.engine` back into the project root."
+            )
+        raise SystemExit(
+            "Missing TensorRT export dependencies in the project virtualenv. "
+            f"Install them first with:\n./.venv/bin/pip install {missing_str}{compatibility_hint}"
+        )
+
+    # Try to preload packaged TensorRT shared libraries when available.
+    if importlib.util.find_spec("tensorrt_libs") is not None:
+        __import__("tensorrt_libs")
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
