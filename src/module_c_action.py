@@ -9,6 +9,7 @@ Pipeline:
   5. Output annotated video + CSV
 
 Model:  runs/train_horizontal/final_safe_system.pth
+        or runs/train_extratrees_v2f/extratrees_model.joblib
 Pose:   yolov8n-pose.pt
 
 Usage:
@@ -31,6 +32,7 @@ from pathlib import Path
 from typing import Dict, Optional, Tuple
 
 import cv2
+import joblib
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -157,6 +159,34 @@ def prepare_sequence(buffer: deque, seq_len: int = SEQ_LEN) -> np.ndarray:
     return full[np.newaxis].astype(np.float32)             # (1, SEQ_LEN, 69)
 
 
+def build_extratrees_feature_vector(seq69: np.ndarray) -> np.ndarray:
+    """
+    seq69: (T, 69) -> feature vector (759,)
+    Must match train_extratrees_action.py feature engineering.
+    """
+    q25 = np.quantile(seq69, 0.25, axis=0)
+    q75 = np.quantile(seq69, 0.75, axis=0)
+    vel = np.diff(seq69, axis=0)
+
+    feat = np.concatenate(
+        [
+            seq69.mean(axis=0),
+            seq69.std(axis=0),
+            seq69.min(axis=0),
+            seq69.max(axis=0),
+            seq69[0],
+            seq69[-1],
+            (seq69[-1] - seq69[0]),
+            q25,
+            q75,
+            np.mean(np.abs(vel), axis=0),
+            np.std(vel, axis=0),
+        ],
+        axis=0,
+    )
+    return feat.astype(np.float32)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  Action Recognizer
 # ─────────────────────────────────────────────────────────────────────────────
@@ -169,42 +199,64 @@ class ActionRecognizer:
     def __init__(self, model_path: str, device: str = "auto",
                  num_classes: int = 5, hidden_dim: int = 128,
                  num_layers: int = 3, num_heads: int = 8):
-        if device == "auto":
-            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        else:
-            self.device = torch.device(device)
-
-        self.model = ActionRecognitionModel(
-            input_dim=69,
-            hidden_dim=hidden_dim,
-            num_layers=num_layers,
-            num_classes=num_classes,
-            num_heads=num_heads,
-            dropout=0.0,          # inference: no dropout
-        ).to(self.device)
-
-        checkpoint = torch.load(model_path, map_location=self.device, weights_only=False)
-        # Checkpoint có thể là dict {model_state_dict: ...} hoặc state_dict thẳng
-        if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
-            state = checkpoint["model_state_dict"]
-        else:
-            state = checkpoint
-        self.model.load_state_dict(state)
-        self.model.eval()
-        print(f"[Module C] Loaded action model from {model_path}  (device={self.device})")
-
-        # Load StandardScaler statistics (nếu có trong checkpoint)
+        self.label_map = LABEL_MAP.copy()
+        self.backend = "torch"
+        self.et_model = None
+        self.model = None
+        self.device = torch.device("cpu")
         self.feat_mean: Optional[np.ndarray] = None
-        self.feat_std:  Optional[np.ndarray] = None
-        if isinstance(checkpoint, dict):
-            fm = checkpoint.get("feat_mean")
-            fs = checkpoint.get("feat_std")
-            if fm is not None and fs is not None:
-                self.feat_mean = np.array(fm, dtype=np.float32)
-                self.feat_std  = np.array(fs, dtype=np.float32)
-                print(f"[Module C] StandardScaler loaded: mean={self.feat_mean.mean():.4f} std={self.feat_std.mean():.4f}")
+        self.feat_std: Optional[np.ndarray] = None
+
+        model_path_l = str(model_path).lower()
+        if model_path_l.endswith(".joblib"):
+            artifact = joblib.load(model_path)
+            if isinstance(artifact, dict) and "model" in artifact:
+                self.et_model = artifact["model"]
+                lm = artifact.get("label_map")
+                if isinstance(lm, dict):
+                    self.label_map = {int(k): str(v) for k, v in lm.items()}
             else:
-                print("[Module C] No scaler in checkpoint — running without normalization")
+                self.et_model = artifact
+            self.backend = "extratrees"
+            print(f"[Module C] Loaded ExtraTrees model from {model_path}")
+        else:
+            if device == "auto":
+                self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            else:
+                self.device = torch.device(device)
+
+            self.model = ActionRecognitionModel(
+                input_dim=69,
+                hidden_dim=hidden_dim,
+                num_layers=num_layers,
+                num_classes=num_classes,
+                num_heads=num_heads,
+                dropout=0.0,          # inference: no dropout
+            ).to(self.device)
+
+            checkpoint = torch.load(model_path, map_location=self.device, weights_only=False)
+            # Checkpoint có thể là dict {model_state_dict: ...} hoặc state_dict thẳng
+            if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+                state = checkpoint["model_state_dict"]
+            else:
+                state = checkpoint
+            self.model.load_state_dict(state)
+            self.model.eval()
+            print(f"[Module C] Loaded action model from {model_path}  (device={self.device})")
+
+            # Load StandardScaler statistics (nếu có trong checkpoint)
+            if isinstance(checkpoint, dict):
+                fm = checkpoint.get("feat_mean")
+                fs = checkpoint.get("feat_std")
+                if fm is not None and fs is not None:
+                    self.feat_mean = np.array(fm, dtype=np.float32)
+                    self.feat_std = np.array(fs, dtype=np.float32)
+                    print(
+                        f"[Module C] StandardScaler loaded: "
+                        f"mean={self.feat_mean.mean():.4f} std={self.feat_std.mean():.4f}"
+                    )
+                else:
+                    print("[Module C] No scaler in checkpoint — running without normalization")
 
         # Per-track state
         self._buffers: Dict[int, deque] = {}        # track_id → deque of (17,2)
@@ -250,20 +302,31 @@ class ActionRecognizer:
         if n_frames < MIN_TRACK_FRAMES or since_pred < PRED_STRIDE:
             # Trả về kết quả cũ
             lid, conf = self._last_pred.get(track_id, (-1, 0.0))
-            return lid, conf, LABEL_MAP.get(lid, "?")
+            return lid, conf, self.label_map.get(lid, "?")
 
         # Reset counter
         self._frames_since_pred[track_id] = 0
 
         x = prepare_sequence(self._buffers[track_id])          # (1, 128, 69)
-        # Apply StandardScaler if available
-        if self.feat_mean is not None:
-            x = (x - self.feat_mean) / self.feat_std
-        xt = torch.FloatTensor(x).to(self.device)
-        logits, _ = self.model(xt)                             # (1, num_classes)
-        probs = F.softmax(logits, dim=-1)[0].cpu().numpy()
-        label_id = int(np.argmax(probs))
-        confidence = float(probs[label_id])
+        if self.backend == "extratrees":
+            seq69 = x[0]
+            feat = build_extratrees_feature_vector(seq69)[np.newaxis, :]
+            if hasattr(self.et_model, "predict_proba"):
+                probs = self.et_model.predict_proba(feat)[0]
+                label_id = int(np.argmax(probs))
+                confidence = float(probs[label_id])
+            else:
+                label_id = int(self.et_model.predict(feat)[0])
+                confidence = 1.0
+        else:
+            # Apply StandardScaler if available
+            if self.feat_mean is not None:
+                x = (x - self.feat_mean) / self.feat_std
+            xt = torch.FloatTensor(x).to(self.device)
+            logits, _ = self.model(xt)                         # (1, num_classes)
+            probs = F.softmax(logits, dim=-1)[0].cpu().numpy()
+            label_id = int(np.argmax(probs))
+            confidence = float(probs[label_id])
 
         # Chỉ cập nhật nếu confidence đủ cao
         if confidence >= CONF_THRESHOLD:
@@ -278,7 +341,7 @@ class ActionRecognizer:
             self._last_pred[track_id] = (smoothed_id, confidence)
 
         lid, conf = self._last_pred[track_id]
-        return lid, conf, LABEL_MAP.get(lid, "?")
+        return lid, conf, self.label_map.get(lid, "?")
 
     def remove_stale_tracks(self, active_ids: set, max_age: int = 90):
         """Giải phóng bộ nhớ cho track không còn active."""
@@ -532,7 +595,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--video",       required=True,
                    help="Đường dẫn tới video input")
     p.add_argument("--model_path",  default="runs/train_horizontal/final_safe_system.pth",
-                   help="Path to trained .pth checkpoint")
+                   help="Path to trained model (.pth or .joblib)")
     p.add_argument("--pose_model",  default="yolov8n-pose.pt",
                    help="YOLOv8-Pose weight")
     p.add_argument("--out",         default="runs/action/run1",

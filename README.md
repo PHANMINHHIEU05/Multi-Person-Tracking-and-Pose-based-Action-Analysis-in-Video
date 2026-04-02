@@ -21,6 +21,9 @@ The system is built as a modular computer vision pipeline combining YOLOv8, BoT-
 # Install dependencies
 pip install -r requirements.txt
 
+# Launch PyQt6 desktop UI
+python pyqt_app.py
+
 # Run full pipeline (action recognition) on a video
 python main.py --video data/video/video1.mp4
 
@@ -41,6 +44,19 @@ python main.py --video data/video/video1.mp4 --preview
 - `video_action.mp4` — annotated video with bounding boxes, skeleton, action labels
 - `actions.csv` — per-frame: `frame, track_id, action, confidence, x1, y1, x2, y2`
 - `summary.json` — run metadata
+
+## 2.1 Desktop UI
+
+`pyqt_app.py` is a desktop-first replacement path for the previous Streamlit UI.
+It is better suited for low-latency preview because frames are rendered directly in a Qt window instead of being pushed through browser updates.
+
+Current PyQt6 UI includes:
+- Upload video mode
+- Webcam mode
+- Live preview in a native desktop window
+- Action recognition toggle
+- Tracking/detection/runtime controls
+- Annotated output video saving for uploaded videos
 
 ---
 

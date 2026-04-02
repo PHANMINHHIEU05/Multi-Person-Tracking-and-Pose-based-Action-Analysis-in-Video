@@ -1,7 +1,7 @@
 tracker_type: bytetrack # FIX:
-track_high_thresh: 0.25 # FIX:
-track_low_thresh: 0.05 # FIX:
-new_track_thresh: 0.3 # FIX:
-track_buffer: 90 # FIX:
-match_thresh: 0.7 # FIX:
+track_high_thresh: 0.45 # FIX:
+track_low_thresh: 0.10 # FIX:
+new_track_thresh: 0.70 # FIX:
+track_buffer: 180 # FIX:
+match_thresh: 0.80 # FIX:
 fuse_score: True # FIX: required by current ultralytics ByteTrack implementation
