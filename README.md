@@ -24,6 +24,9 @@ pip install -r requirements.txt
 # Launch the primary PyQt6 desktop UI
 python pyqt_app.py
 
+# Optional: export TensorRT pose engine on an NVIDIA RTX machine
+python export_pose_engine.py
+
 # Run full pipeline (action recognition) on a video
 python main.py --video data/video/video1.mp4
 
@@ -57,6 +60,8 @@ Current PyQt6 UI includes:
 - Action recognition toggle
 - Tracking/detection/runtime controls
 - Annotated output video saving for uploaded videos
+
+If `yolov8n-pose.engine` exists in the project root, the PyQt6 app now auto-prefers it over `yolov8n-pose.pt`.
 
 ---
 

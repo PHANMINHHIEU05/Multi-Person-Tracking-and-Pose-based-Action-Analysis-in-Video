@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import queue
 import threading
 import time
 from collections import defaultdict
@@ -61,6 +62,7 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 _POSE_MODEL_CACHE = {}
 DEFAULT_PREVIEW_WIDTH = 960
 DEFAULT_PREVIEW_HEIGHT = 540
+VIDEO_READER_QUEUE_SIZE = 8
 
 
 def load_pose_model_qt(weights_path: str):
@@ -302,6 +304,11 @@ class InferenceWorker(QThread):
         fps_ema = fps_src if fps_src > 0 else 30.0
         action_counts = defaultdict(int)
         detection_stats = {"frames_processed": 0, "frames_with_detections": 0, "total_detections": 0}
+        reader: Optional[VideoFrameReader] = None
+        if cfg.source_mode == "video":
+            reader = VideoFrameReader(cap=cap, max_frames=max_frames)
+            reader.start()
+            self.status_ready.emit("Async video decode: enabled")
 
         raw_to_stable_id: dict[int, int] = {}
         raw_last_seen: dict[int, int] = {}
@@ -350,11 +357,17 @@ class InferenceWorker(QThread):
         self.status_ready.emit("Running inference...")
 
         while not self._stop_requested:
-            ok, frame = cap.read()
-            if not ok:
-                break
-            if max_frames is not None and frame_idx >= max_frames:
-                break
+            if reader is not None:
+                packet = reader.read(timeout=1.0)
+                if packet is None:
+                    break
+                frame_idx, frame = packet
+            else:
+                ok, frame = cap.read()
+                if not ok:
+                    break
+                if max_frames is not None and frame_idx >= max_frames:
+                    break
 
             detection_stats["frames_processed"] += 1
             visible_ids: set[int] = set()
@@ -495,9 +508,14 @@ class InferenceWorker(QThread):
                     }
                 )
 
-            frame_idx += 1
+            if reader is None:
+                frame_idx += 1
 
-        cap.release()
+        if reader is not None:
+            reader.stop()
+            reader.join(timeout=2.0)
+        else:
+            cap.release()
         if writer is not None:
             writer.release()
 
@@ -529,6 +547,66 @@ class InferenceWorker(QThread):
             "stopped": self._stop_requested,
             "action_counts": dict(action_counts),
         }
+
+
+class VideoFrameReader(threading.Thread):
+    def __init__(self, cap: cv2.VideoCapture, max_frames: Optional[int], queue_size: int = VIDEO_READER_QUEUE_SIZE):
+        super().__init__(daemon=True)
+        self.cap = cap
+        self.max_frames = max_frames
+        self.queue: queue.Queue[Optional[Tuple[int, np.ndarray]]] = queue.Queue(maxsize=queue_size)
+        self.stop_event = threading.Event()
+        self.error: Optional[BaseException] = None
+
+    def stop(self) -> None:
+        self.stop_event.set()
+
+    def read(self, timeout: float = 1.0) -> Optional[Tuple[int, np.ndarray]]:
+        while True:
+            try:
+                item = self.queue.get(timeout=timeout)
+            except queue.Empty:
+                if not self.is_alive():
+                    if self.error is not None:
+                        raise RuntimeError("Video reader thread failed.") from self.error
+                    return None
+                continue
+
+            if item is None:
+                if self.error is not None:
+                    raise RuntimeError("Video reader thread failed.") from self.error
+                return None
+            return item
+
+    def run(self) -> None:
+        frame_idx = 0
+        try:
+            while not self.stop_event.is_set():
+                if self.max_frames is not None and frame_idx >= max(self.max_frames, 0):
+                    break
+                ok, frame = self.cap.read()
+                if not ok:
+                    break
+                while not self.stop_event.is_set():
+                    try:
+                        self.queue.put((frame_idx, frame), timeout=0.1)
+                        break
+                    except queue.Full:
+                        continue
+                frame_idx += 1
+        except BaseException as exc:
+            self.error = exc
+        finally:
+            self.cap.release()
+            while True:
+                try:
+                    self.queue.put(None, timeout=0.1)
+                    break
+                except queue.Full:
+                    try:
+                        self.queue.get_nowait()
+                    except queue.Empty:
+                        pass
 
 
 class MainWindow(QMainWindow):
