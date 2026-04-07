@@ -122,6 +122,73 @@ class RuntimeConfig:
     sitting_conf_penalty: float
 
 
+@dataclass
+class VisualTrackState:
+    bbox: np.ndarray
+    label: str
+    conf: float
+    color: tuple[int, int, int]
+    kpts: Optional[np.ndarray]
+    prev_bbox: Optional[np.ndarray]
+    prev_kpts: Optional[np.ndarray]
+    last_frame_idx: int
+    prev_frame_idx: int
+
+
+def smooth_motion_array(
+    previous: Optional[np.ndarray],
+    current: Optional[np.ndarray],
+    alpha: float,
+) -> Optional[np.ndarray]:
+    if current is None:
+        return previous.copy() if previous is not None else None
+    current_f32 = current.astype(np.float32, copy=True)
+    if previous is None:
+        return current_f32
+    return ((1.0 - alpha) * previous + alpha * current_f32).astype(np.float32)
+
+
+def extrapolate_motion_array(
+    current: Optional[np.ndarray],
+    previous: Optional[np.ndarray],
+    current_frame_idx: int,
+    previous_frame_idx: int,
+    target_frame_idx: int,
+    *,
+    velocity_scale: float = 0.8,
+    clamp_unit: bool = False,
+) -> Optional[np.ndarray]:
+    if current is None:
+        return None
+    predicted = current.astype(np.float32, copy=True)
+    if previous is not None and current_frame_idx > previous_frame_idx >= 0 and target_frame_idx > current_frame_idx:
+        frame_delta = float(current_frame_idx - previous_frame_idx)
+        velocity = (predicted - previous) / max(frame_delta, 1.0)
+        predicted = predicted + velocity * float(target_frame_idx - current_frame_idx) * velocity_scale
+    if clamp_unit:
+        predicted = np.clip(predicted, 0.0, 1.0)
+    return predicted.astype(np.float32)
+
+
+def resolve_visual_draw_state(state: VisualTrackState, target_frame_idx: int) -> tuple[np.ndarray, Optional[np.ndarray], str, float, tuple[int, int, int]]:
+    bbox = extrapolate_motion_array(
+        state.bbox,
+        state.prev_bbox,
+        state.last_frame_idx,
+        state.prev_frame_idx,
+        target_frame_idx,
+    )
+    kpts = extrapolate_motion_array(
+        state.kpts,
+        state.prev_kpts,
+        state.last_frame_idx,
+        state.prev_frame_idx,
+        target_frame_idx,
+        clamp_unit=True,
+    )
+    return bbox if bbox is not None else state.bbox.copy(), kpts, state.label, state.conf, state.color
+
+
 class InferenceWorker(QThread):
     frame_ready = pyqtSignal()
     metrics_ready = pyqtSignal(dict)
@@ -314,7 +381,7 @@ class InferenceWorker(QThread):
         raw_last_seen: dict[int, int] = {}
         stable_last_bbox: dict[int, np.ndarray] = {}
         stable_last_seen: dict[int, int] = {}
-        overlay_cache_by_id: dict[int, tuple[np.ndarray, str, float, tuple[int, int, int]]] = {}
+        visual_state_by_id: dict[int, VisualTrackState] = {}
         unique_stable_ids: set[int] = set()
         next_stable_id = 1
         max_id_idle_frames = max(90, int(round(fps_src * 6.0)))
@@ -375,7 +442,7 @@ class InferenceWorker(QThread):
             should_process_frame = frame_idx % effective_process_stride == 0
             action_update_due = frame_idx % max(1, effective_action_update_stride) == 0
             preview_emit_due = cfg.live_preview
-            should_draw_this_frame = (writer is not None) or cfg.live_preview
+            should_draw_this_frame = (writer is not None) or preview_emit_due
 
             if should_process_frame:
                 assigned_stable_ids: set[int] = set()
@@ -434,11 +501,31 @@ class InferenceWorker(QThread):
                             action_counts[label_name] += 1
 
                         color = LABEL_COLORS.get(label_id, (200, 200, 200))
-                        overlay_cache_by_id[display_tid] = (bbox.copy(), label_name, conf_val, color)
+                        existing_state = visual_state_by_id.get(display_tid)
+                        prev_bbox = existing_state.bbox.copy() if existing_state is not None else None
+                        prev_kpts = existing_state.kpts.copy() if existing_state is not None and existing_state.kpts is not None else None
+                        prev_frame_idx = existing_state.last_frame_idx if existing_state is not None else -1
+                        smoothed_bbox = smooth_motion_array(prev_bbox, bbox, alpha=0.68)
+                        smoothed_kpts = smooth_motion_array(prev_kpts, kpts, alpha=0.58)
+                        visual_state_by_id[display_tid] = VisualTrackState(
+                            bbox=smoothed_bbox if smoothed_bbox is not None else bbox.astype(np.float32, copy=True),
+                            label=label_name,
+                            conf=conf_val,
+                            color=color,
+                            kpts=smoothed_kpts,
+                            prev_bbox=prev_bbox,
+                            prev_kpts=prev_kpts,
+                            last_frame_idx=frame_idx,
+                            prev_frame_idx=prev_frame_idx,
+                        )
                         if should_draw_this_frame:
-                            if cfg.draw_skeleton and kpts is not None:
-                                draw_skeleton(frame, kpts, color, frame.shape[1], frame.shape[0])
-                            draw_action_label(frame, bbox, display_tid, label_name, conf_val, color)
+                            draw_bbox, draw_kpts, draw_label, draw_conf, draw_color = resolve_visual_draw_state(
+                                visual_state_by_id[display_tid],
+                                frame_idx,
+                            )
+                            if cfg.draw_skeleton and draw_kpts is not None:
+                                draw_skeleton(frame, draw_kpts, draw_color, frame.shape[1], frame.shape[0])
+                            draw_action_label(frame, draw_bbox, display_tid, draw_label, draw_conf, draw_color)
 
                 stale_raw_ids = [rid for rid, last_seen in raw_last_seen.items() if frame_idx - last_seen > max_id_idle_frames]
                 for rid in stale_raw_ids:
@@ -449,25 +536,35 @@ class InferenceWorker(QThread):
                 for sid in stale_stable_ids:
                     stable_last_seen.pop(sid, None)
                     stable_last_bbox.pop(sid, None)
-                    overlay_cache_by_id.pop(sid, None)
+                    visual_state_by_id.pop(sid, None)
 
                 held_ids = {sid for sid, last_seen in stable_last_seen.items() if frame_idx - last_seen <= track_hold_frames}
                 if should_draw_this_frame:
                     for held_tid in sorted(held_ids - visible_ids):
-                        held_overlay = overlay_cache_by_id.get(held_tid)
-                        if held_overlay is None:
+                        held_state = visual_state_by_id.get(held_tid)
+                        if held_state is None:
                             continue
-                        held_bbox, held_label, held_conf, held_color = held_overlay
+                        held_bbox, held_kpts, held_label, held_conf, held_color = resolve_visual_draw_state(
+                            held_state,
+                            frame_idx,
+                        )
+                        if cfg.draw_skeleton and held_kpts is not None:
+                            draw_skeleton(frame, held_kpts, held_color, frame.shape[1], frame.shape[0])
                         draw_action_label(frame, held_bbox, held_tid, held_label, held_conf, held_color)
                 recognizer_active_ids = held_ids.copy()
             else:
                 recognizer_active_ids = {sid for sid, last_seen in stable_last_seen.items() if frame_idx - last_seen <= track_hold_frames}
                 if should_draw_this_frame:
                     for cached_tid in sorted(recognizer_active_ids):
-                        cached_overlay = overlay_cache_by_id.get(cached_tid)
-                        if cached_overlay is None:
+                        cached_state = visual_state_by_id.get(cached_tid)
+                        if cached_state is None:
                             continue
-                        cached_bbox, cached_label, cached_conf, cached_color = cached_overlay
+                        cached_bbox, cached_kpts, cached_label, cached_conf, cached_color = resolve_visual_draw_state(
+                            cached_state,
+                            frame_idx,
+                        )
+                        if cfg.draw_skeleton and cached_kpts is not None:
+                            draw_skeleton(frame, cached_kpts, cached_color, frame.shape[1], frame.shape[0])
                         draw_action_label(frame, cached_bbox, cached_tid, cached_label, cached_conf, cached_color)
 
             if recognizer is not None:
@@ -479,14 +576,17 @@ class InferenceWorker(QThread):
                     output_frame = cv2.resize(frame, (output_w, output_h), interpolation=cv2.INTER_AREA)
                 writer.write(output_frame)
 
-            now = time.time()
-            fps_ema = 0.92 * fps_ema + 0.08 * (1.0 / max(now - t_prev, 1e-6))
-            t_prev = now
-
             if cfg.live_preview and preview_emit_due:
+                now = time.time()
+                fps_ema = 0.92 * fps_ema + 0.08 * (1.0 / max(now - t_prev, 1e-6))
+                t_prev = now
                 self._store_latest_preview(
                     frame_to_qimage(frame, target_size=(cfg.preview_width, cfg.preview_height))
                 )
+            elif should_process_frame:
+                now = time.time()
+                fps_ema = 0.92 * fps_ema + 0.08 * (1.0 / max(now - t_prev, 1e-6))
+                t_prev = now
 
             if frame_idx % max(1, effective_preview_stride) == 0:
                 self.metrics_ready.emit(

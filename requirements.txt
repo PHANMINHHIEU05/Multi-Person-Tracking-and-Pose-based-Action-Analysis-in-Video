@@ -10,6 +10,7 @@ torchvision
 
 # ===== Detection + Tracking =====
 ultralytics>=8.3.0
+lap==0.5.13
 
 # ===== Pose Estimation =====
 mediapipe==0.10.32
