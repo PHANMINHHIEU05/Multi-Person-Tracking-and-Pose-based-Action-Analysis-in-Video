@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import Counter, deque
 import importlib.util
 from pathlib import Path
+import time
 from typing import Dict, Optional, Tuple
 
 import cv2
@@ -227,6 +228,44 @@ def build_extratrees_feature_vector(seq69: np.ndarray) -> np.ndarray:
     return feat.astype(np.float32)
 
 
+def _valid_keypoint_mask(kpts_norm: np.ndarray) -> np.ndarray:
+    return ~np.all(kpts_norm == 0, axis=1)
+
+
+def _estimate_bbox_norm(
+    kpts_norm: Optional[np.ndarray],
+    bbox_norm: Optional[np.ndarray],
+) -> Tuple[Optional[np.ndarray], float, float]:
+    if bbox_norm is not None:
+        bbox = bbox_norm.astype(np.float32, copy=True)
+        return bbox, max(float(bbox[2] - bbox[0]), 1e-3), max(float(bbox[3] - bbox[1]), 1e-3)
+    if kpts_norm is None:
+        return None, 1e-3, 1e-3
+    valid = _valid_keypoint_mask(kpts_norm)
+    if valid.sum() < 2:
+        return None, 1e-3, 1e-3
+    valid_points = kpts_norm[valid]
+    x1 = float(valid_points[:, 0].min())
+    y1 = float(valid_points[:, 1].min())
+    x2 = float(valid_points[:, 0].max())
+    y2 = float(valid_points[:, 1].max())
+    bbox = np.array([x1, y1, x2, y2], dtype=np.float32)
+    return bbox, max(x2 - x1, 1e-3), max(y2 - y1, 1e-3)
+
+
+def _estimate_body_center(kpts_norm: Optional[np.ndarray]) -> Optional[np.ndarray]:
+    if kpts_norm is None:
+        return None
+    valid = _valid_keypoint_mask(kpts_norm)
+    if valid[L_HIP] and valid[R_HIP]:
+        return ((kpts_norm[L_HIP] + kpts_norm[R_HIP]) * 0.5).astype(np.float32)
+    if valid[L_SHOULDER] and valid[R_SHOULDER]:
+        return ((kpts_norm[L_SHOULDER] + kpts_norm[R_SHOULDER]) * 0.5).astype(np.float32)
+    if valid.any():
+        return np.mean(kpts_norm[valid], axis=0).astype(np.float32)
+    return None
+
+
 class ActionRecognizerLite:
     def __init__(
         self,
@@ -237,6 +276,15 @@ class ActionRecognizerLite:
         smooth_window: int,
         fall_conf_boost: float = 0.10,
         sitting_conf_penalty: float = 0.15,
+        min_keypoint_ratio: float = 0.70,
+        max_keypoint_jitter_ratio: float = 0.15,
+        fall_priority_prob: float = 0.40,
+        fall_velocity_ratio: float = 0.12,
+        sitting_hold_frames: int = 5,
+        sitting_height_ratio: float = 0.85,
+        sitting_area_ratio: float = 0.78,
+        track_time_budget_ms: float = 10.0,
+        fast_track_threshold: int = 5,
     ):
         self.label_map = LABEL_MAP.copy()
         self.backend = "torch"
@@ -296,21 +344,114 @@ class ActionRecognizerLite:
         self._pred_history: Dict[int, list] = {}
         self._feat_cache: Dict[int, np.ndarray] = {}
         self._buf_len_at_cache: Dict[int, int] = {}
+        self._quality_state: Dict[int, Dict[str, float | bool]] = {}
+        self._last_valid_kpts: Dict[int, np.ndarray] = {}
+        self._last_bbox_norm: Dict[int, np.ndarray] = {}
+        self._pending_sitting_until: Dict[int, int] = {}
+        self._last_predict_ms: Dict[int, float] = {}
+        self._fast_mode_overload = False
+        self._fast_mode_used = False
 
-    def update_track(self, track_id: int, kpts_norm: Optional[np.ndarray]):
+        self.min_keypoint_ratio = float(np.clip(min_keypoint_ratio, 0.10, 1.0))
+        self.max_keypoint_jitter_ratio = float(max(max_keypoint_jitter_ratio, 0.01))
+        self.fall_priority_prob = float(np.clip(fall_priority_prob, 0.05, 0.99))
+        self.fall_velocity_ratio = float(max(fall_velocity_ratio, 0.01))
+        self.sitting_hold_frames = max(1, int(sitting_hold_frames))
+        self.sitting_height_ratio = float(np.clip(sitting_height_ratio, 0.30, 1.20))
+        self.sitting_area_ratio = float(np.clip(sitting_area_ratio, 0.20, 1.20))
+        self.fast_track_threshold = max(1, int(fast_track_threshold))
+        self.track_time_budget_ms = float(max(track_time_budget_ms, 1.0))
+
+    def set_active_track_count(self, count: int):
+        self._fast_mode_overload = count > self.fast_track_threshold
+        self._fast_mode_used = self._fast_mode_used or self._fast_mode_overload
+
+    def is_fast_mode_active(self) -> bool:
+        return self.fast_mode or self._fast_mode_overload
+
+    def _build_quality_state(
+        self,
+        track_id: int,
+        kpts_norm: Optional[np.ndarray],
+        bbox_norm: Optional[np.ndarray],
+    ) -> Tuple[Dict[str, float | bool], Optional[np.ndarray]]:
+        quality: Dict[str, float | bool] = {
+            "valid_ratio": 0.0,
+            "jitter_ratio": 0.0,
+            "downward_velocity": 0.0,
+            "fall_velocity": False,
+            "height_ratio": 1.0,
+            "area_ratio": 1.0,
+            "looks_sit_transition": False,
+            "noisy": False,
+        }
+        previous_kpts = self._last_valid_kpts.get(track_id)
+        previous_bbox = self._last_bbox_norm.get(track_id)
+        current_bbox, bbox_w, bbox_h = _estimate_bbox_norm(kpts_norm, bbox_norm)
+
+        if kpts_norm is None:
+            return quality, current_bbox
+
+        valid_mask = _valid_keypoint_mask(kpts_norm)
+        quality["valid_ratio"] = float(valid_mask.sum() / max(kpts_norm.shape[0], 1))
+
+        if previous_kpts is not None:
+            prev_valid_mask = _valid_keypoint_mask(previous_kpts)
+            common_mask = valid_mask & prev_valid_mask
+            if common_mask.any():
+                displacement = np.linalg.norm(kpts_norm[common_mask] - previous_kpts[common_mask], axis=1)
+                quality["jitter_ratio"] = float(np.median(displacement) / max(bbox_w, bbox_h, 1e-3))
+
+        current_center = _estimate_body_center(kpts_norm)
+        previous_center = _estimate_body_center(previous_kpts) if previous_kpts is not None else None
+        if current_center is not None and previous_center is not None:
+            quality["downward_velocity"] = float((current_center[1] - previous_center[1]) / max(bbox_h, 1e-3))
+
+        if previous_bbox is not None and current_bbox is not None:
+            prev_w = max(float(previous_bbox[2] - previous_bbox[0]), 1e-3)
+            prev_h = max(float(previous_bbox[3] - previous_bbox[1]), 1e-3)
+            prev_area = max(prev_w * prev_h, 1e-3)
+            quality["height_ratio"] = float(bbox_h / prev_h)
+            quality["area_ratio"] = float((bbox_w * bbox_h) / prev_area)
+
+        quality["fall_velocity"] = bool(quality["downward_velocity"] > self.fall_velocity_ratio)
+        quality["looks_sit_transition"] = bool(
+            quality["height_ratio"] < self.sitting_height_ratio or quality["area_ratio"] < self.sitting_area_ratio
+        )
+        quality["noisy"] = bool(quality["jitter_ratio"] > self.max_keypoint_jitter_ratio)
+        return quality, current_bbox
+
+    def update_track(self, track_id: int, kpts_norm: Optional[np.ndarray], bbox_norm: Optional[np.ndarray] = None):
         if track_id not in self._buffers:
             self._buffers[track_id] = deque(maxlen=SEQ_LEN)
             self._frame_count[track_id] = 0
             self._last_pred[track_id] = (-1, 0.0)
             self._frames_since_pred[track_id] = 0
 
+        quality, current_bbox = self._build_quality_state(track_id, kpts_norm, bbox_norm)
+        self._quality_state[track_id] = quality
+
+        previous_valid = self._last_valid_kpts.get(track_id)
         if kpts_norm is None:
-            if len(self._buffers[track_id]) > 0:
-                self._buffers[track_id].append(self._buffers[track_id][-1].copy())
+            if previous_valid is not None:
+                buffer_kpts = previous_valid.copy()
+            elif len(self._buffers[track_id]) > 0:
+                buffer_kpts = self._buffers[track_id][-1].copy()
             else:
-                self._buffers[track_id].append(np.zeros((17, 2), dtype=np.float32))
+                buffer_kpts = np.zeros((17, 2), dtype=np.float32)
+        elif bool(quality["valid_ratio"] < self.min_keypoint_ratio or quality["noisy"]):
+            if previous_valid is not None:
+                buffer_kpts = previous_valid.copy()
+            else:
+                buffer_kpts = kpts_norm.astype(np.float32, copy=True)
         else:
-            self._buffers[track_id].append(kpts_norm)
+            buffer_kpts = kpts_norm.astype(np.float32, copy=True)
+            self._last_valid_kpts[track_id] = buffer_kpts.copy()
+
+        self._buffers[track_id].append(buffer_kpts)
+
+        if current_bbox is not None:
+            self._last_bbox_norm[track_id] = current_bbox.copy()
 
         self._frame_count[track_id] += 1
         self._frames_since_pred[track_id] += 1
@@ -326,11 +467,16 @@ class ActionRecognizerLite:
 
         self._frames_since_pred[track_id] = 0
 
+        quality = self._quality_state.get(track_id, {})
+        if float(quality.get("valid_ratio", 0.0)) < self.min_keypoint_ratio or bool(quality.get("noisy", False)):
+            lid, conf = self._last_pred.get(track_id, (-1, 0.0))
+            return lid, conf, self.label_map.get(lid, "?")
+
         buf_len = len(self._buffers[track_id])
         cached_len = self._buf_len_at_cache.get(track_id, -1)
         if track_id not in self._feat_cache or buf_len != cached_len:
             if self.backend == "extratrees":
-                if self.fast_mode:
+                if self.is_fast_mode_active():
                     x = prepare_sequence_fast(self._buffers[track_id], seq_len=self.fast_seq_len)
                 else:
                     x = prepare_sequence(self._buffers[track_id])
@@ -343,6 +489,8 @@ class ActionRecognizerLite:
         else:
             x = self._feat_cache[track_id]
 
+        probs = None
+        started_at = time.perf_counter()
         if self.backend == "extratrees":
             seq69 = x[0]
             feat = build_extratrees_feature_vector(seq69)[np.newaxis, :]
@@ -359,6 +507,15 @@ class ActionRecognizerLite:
             probs = F.softmax(logits, dim=-1)[0].cpu().numpy()
             label_id = int(np.argmax(probs))
             confidence = float(probs[label_id])
+        self._last_predict_ms[track_id] = (time.perf_counter() - started_at) * 1000.0
+        if self._last_predict_ms[track_id] > self.track_time_budget_ms and self.backend == "extratrees":
+            self._fast_mode_overload = True
+            self._fast_mode_used = True
+
+        fall_prob = float(probs[0]) if probs is not None and len(probs) > 0 else (confidence if label_id == 0 else 0.0)
+        if fall_prob >= self.fall_priority_prob and bool(quality.get("fall_velocity", False)):
+            label_id = 0
+            confidence = max(confidence, fall_prob)
 
         class_threshold = self.conf_threshold
         if label_id == 0:
@@ -367,6 +524,18 @@ class ActionRecognizerLite:
             class_threshold = min(0.99, self.conf_threshold + self.sitting_conf_penalty)
 
         if confidence >= class_threshold:
+            last_label_id = self._last_pred.get(track_id, (-1, 0.0))[0]
+            if label_id == 2 and last_label_id == 1 and bool(quality.get("looks_sit_transition", False)) and not bool(quality.get("fall_velocity", False)):
+                hold_until = self._pending_sitting_until.get(track_id)
+                if hold_until is None:
+                    self._pending_sitting_until[track_id] = n_frames + self.sitting_hold_frames
+                    lid, conf = self._last_pred.get(track_id, (-1, 0.0))
+                    return lid, conf, self.label_map.get(lid, "?")
+                if n_frames < hold_until:
+                    lid, conf = self._last_pred.get(track_id, (-1, 0.0))
+                    return lid, conf, self.label_map.get(lid, "?")
+            else:
+                self._pending_sitting_until.pop(track_id, None)
             hist = self._pred_history.setdefault(track_id, [])
             if label_id == 0 and confidence >= max(class_threshold, 0.35):
                 hist.clear()
@@ -386,6 +555,26 @@ class ActionRecognizerLite:
         lid, conf = self._last_pred.get(track_id, (-1, 0.0))
         return lid, conf, self.label_map.get(lid, "?")
 
+    def get_debug_state(self, track_id: int) -> Dict[str, float | bool | int | str]:
+        quality = self._quality_state.get(track_id, {})
+        lid, conf = self._last_pred.get(track_id, (-1, 0.0))
+        frames_remaining = max(0, self._pending_sitting_until.get(track_id, 0) - self._frame_count.get(track_id, 0))
+        return {
+            "track_id": int(track_id),
+            "label_id": int(lid),
+            "label_name": self.label_map.get(lid, "?"),
+            "confidence": float(conf),
+            "valid_ratio": float(quality.get("valid_ratio", 0.0)),
+            "jitter_ratio": float(quality.get("jitter_ratio", 0.0)),
+            "downward_velocity": float(quality.get("downward_velocity", 0.0)),
+            "fall_velocity": bool(quality.get("fall_velocity", False)),
+            "looks_sit_transition": bool(quality.get("looks_sit_transition", False)),
+            "noisy": bool(quality.get("noisy", False)),
+            "predict_ms": float(self._last_predict_ms.get(track_id, 0.0)),
+            "pending_sitting_frames": int(frames_remaining),
+            "fast_mode_active": bool(self.is_fast_mode_active()),
+        }
+
     def remove_stale_tracks(self, active_ids: set[int]):
         dead = [tid for tid in self._buffers if tid not in active_ids]
         for tid in dead:
@@ -396,6 +585,11 @@ class ActionRecognizerLite:
             self._pred_history.pop(tid, None)
             self._feat_cache.pop(tid, None)
             self._buf_len_at_cache.pop(tid, None)
+            self._quality_state.pop(tid, None)
+            self._last_valid_kpts.pop(tid, None)
+            self._last_bbox_norm.pop(tid, None)
+            self._pending_sitting_until.pop(tid, None)
+            self._last_predict_ms.pop(tid, None)
 
 
 def extract_kpts_for_track(result, track_id: int, w: int, h: int) -> Optional[np.ndarray]:

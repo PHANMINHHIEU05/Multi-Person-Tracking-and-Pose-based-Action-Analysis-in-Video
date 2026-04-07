@@ -77,12 +77,7 @@ def frame_to_qimage(frame_bgr: np.ndarray, target_size: Optional[Tuple[int, int]
     if target_size is not None:
         target_w = max(1, int(target_size[0]))
         target_h = max(1, int(target_size[1]))
-        src_h, src_w = frame_bgr.shape[:2]
-        scale = min(target_w / max(src_w, 1), target_h / max(src_h, 1), 1.0)
-        if scale < 0.999:
-            resized_w = max(1, int(round(src_w * scale)))
-            resized_h = max(1, int(round(src_h * scale)))
-            frame_bgr = cv2.resize(frame_bgr, (resized_w, resized_h), interpolation=cv2.INTER_AREA)
+        frame_bgr = cv2.resize(frame_bgr, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
     rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
     h, w, ch = rgb.shape
     image = QImage(rgb.data, w, h, ch * w, QImage.Format.Format_RGB888)
@@ -120,6 +115,13 @@ class RuntimeConfig:
     smooth_window: int
     fall_conf_boost: float
     sitting_conf_penalty: float
+    keypoint_integrity_ratio: float
+    keypoint_jitter_ratio: float
+    fall_priority_prob: float
+    fall_velocity_ratio: float
+    sitting_hold_frames: int
+    track_time_budget_ms: float
+    fast_track_threshold: int
 
 
 @dataclass
@@ -207,16 +209,6 @@ class InferenceWorker(QThread):
     def stop(self) -> None:
         self._stop_requested = True
 
-    def _store_latest_preview(self, image: QImage) -> None:
-        should_emit = False
-        with self._preview_lock:
-            self._latest_preview_image = image
-            if not self._preview_signal_pending:
-                self._preview_signal_pending = True
-                should_emit = True
-        if should_emit:
-            self.frame_ready.emit()
-
     def take_latest_preview(self) -> Optional[QImage]:
         with self._preview_lock:
             image = self._latest_preview_image
@@ -237,6 +229,13 @@ class InferenceWorker(QThread):
             smooth_window=self.config.smooth_window,
             fall_conf_boost=self.config.fall_conf_boost,
             sitting_conf_penalty=self.config.sitting_conf_penalty,
+            min_keypoint_ratio=self.config.keypoint_integrity_ratio,
+            max_keypoint_jitter_ratio=self.config.keypoint_jitter_ratio,
+            fall_priority_prob=self.config.fall_priority_prob,
+            fall_velocity_ratio=self.config.fall_velocity_ratio,
+            sitting_hold_frames=self.config.sitting_hold_frames,
+            track_time_budget_ms=self.config.track_time_budget_ms,
+            fast_track_threshold=self.config.fast_track_threshold,
         )
 
     def run(self) -> None:
@@ -307,12 +306,14 @@ class InferenceWorker(QThread):
         effective_action_update_stride = 1
         action_backend = None
         action_fast_mode = False
+        action_fast_mode_used = False
         effective_action_pred_stride = None
         if recognizer is not None:
             action_backend = getattr(recognizer, "backend", "unknown")
             if action_backend == "extratrees":
                 action_fast_mode = bool(cfg.auto_tune_cpu and cpu_only and cfg.source_mode == "video")
                 recognizer.fast_mode = action_fast_mode
+                action_fast_mode_used = action_fast_mode
             if action_backend == "torch":
                 effective_action_update_stride = 2 if cfg.source_mode == "webcam" else 3
             else:
@@ -336,6 +337,7 @@ class InferenceWorker(QThread):
                 )
             if cfg.auto_tune_cpu and cpu_only and cfg.source_mode == "video":
                 effective_action_update_stride = max(effective_action_update_stride, 3)
+            effective_action_update_stride = max(effective_action_update_stride, 10)
 
         output_w = max(1, int(w * cfg.output_scale))
         output_h = max(1, int(h * cfg.output_scale))
@@ -464,6 +466,9 @@ class InferenceWorker(QThread):
                     detection_stats["frames_with_detections"] += 1
                     track_ids = result.boxes.id.cpu().numpy().astype(int)
                     bboxes = result.boxes.xyxy.cpu().numpy()
+                    if recognizer is not None:
+                        recognizer.set_active_track_count(len(track_ids))
+                        action_fast_mode_used = action_fast_mode_used or recognizer.is_fast_mode_active()
 
                     for i, tid in enumerate(track_ids):
                         raw_tid = int(tid)
@@ -478,16 +483,24 @@ class InferenceWorker(QThread):
                         stable_last_seen[display_tid] = frame_idx
                         visible_ids.add(display_tid)
 
-                        needs_action_update = (
-                            recognizer is not None
-                            and (action_update_due or display_tid not in recognizer._buffers)
+                        needs_action_update = recognizer is not None and (
+                            action_update_due or recognizer.get_last_prediction(display_tid)[0] < 0
                         )
-                        needs_kpts = cfg.draw_skeleton or needs_action_update
+                        needs_kpts = cfg.draw_skeleton or recognizer is not None
                         kpts = extract_kpts_for_track(result, raw_tid, frame.shape[1], frame.shape[0]) if needs_kpts else None
+                        bbox_norm = np.array(
+                            [
+                                bbox[0] / max(frame.shape[1], 1),
+                                bbox[1] / max(frame.shape[0], 1),
+                                bbox[2] / max(frame.shape[1], 1),
+                                bbox[3] / max(frame.shape[0], 1),
+                            ],
+                            dtype=np.float32,
+                        )
 
                         if recognizer is not None:
+                            recognizer.update_track(display_tid, kpts, bbox_norm=bbox_norm)
                             if needs_action_update:
-                                recognizer.update_track(display_tid, kpts)
                                 label_id, conf_val, label_name = recognizer.predict(display_tid)
                             else:
                                 label_id, conf_val, label_name = recognizer.get_last_prediction(display_tid)
@@ -580,15 +593,53 @@ class InferenceWorker(QThread):
                 now = time.time()
                 fps_ema = 0.92 * fps_ema + 0.08 * (1.0 / max(now - t_prev, 1e-6))
                 t_prev = now
-                self._store_latest_preview(
-                    frame_to_qimage(frame, target_size=(cfg.preview_width, cfg.preview_height))
-                )
+                qt_img = frame_to_qimage(frame, target_size=(cfg.preview_width, cfg.preview_height))
+                should_emit_preview = False
+                with self._preview_lock:
+                    self._latest_preview_image = qt_img
+                    if not self._preview_signal_pending:
+                        self._preview_signal_pending = True
+                        should_emit_preview = True
+                if should_emit_preview:
+                    self.frame_ready.emit()
             elif should_process_frame:
                 now = time.time()
                 fps_ema = 0.92 * fps_ema + 0.08 * (1.0 / max(now - t_prev, 1e-6))
                 t_prev = now
 
             if frame_idx % max(1, effective_preview_stride) == 0:
+                guardrail_debug_html = ""
+                if recognizer is not None:
+                    debug_ids = sorted(visible_ids if visible_ids else recognizer_active_ids)[:6]
+                    if debug_ids:
+                        rows = []
+                        for debug_tid in debug_ids:
+                            debug_state = recognizer.get_debug_state(debug_tid)
+                            rows.append(
+                                "<tr>"
+                                f"<td>{debug_tid}</td>"
+                                f"<td>{debug_state.get('label_name', '?')}</td>"
+                                f"<td>{debug_state.get('confidence', 0.0):.0%}</td>"
+                                f"<td>{debug_state.get('valid_ratio', 0.0):.0%}</td>"
+                                f"<td>{debug_state.get('jitter_ratio', 0.0):.2f}</td>"
+                                f"<td>{debug_state.get('downward_velocity', 0.0):.2f}</td>"
+                                f"<td>{'Y' if debug_state.get('fall_velocity', False) else 'N'}</td>"
+                                f"<td>{'Y' if debug_state.get('noisy', False) else 'N'}</td>"
+                                f"<td>{debug_state.get('pending_sitting_frames', 0)}</td>"
+                                f"<td>{debug_state.get('predict_ms', 0.0):.1f}</td>"
+                                "</tr>"
+                            )
+                        guardrail_debug_html = (
+                            "<table style='width:100%; border-collapse:collapse;'>"
+                            "<thead><tr>"
+                            "<th align='left'>ID</th><th align='left'>Label</th><th align='left'>Conf</th>"
+                            "<th align='left'>Valid</th><th align='left'>Jitter</th><th align='left'>DownVel</th>"
+                            "<th align='left'>FallVel</th><th align='left'>Noisy</th><th align='left'>SitHold</th>"
+                            "<th align='left'>Pred ms</th>"
+                            "</tr></thead><tbody>"
+                            + "".join(rows)
+                            + "</tbody></table>"
+                        )
                 self.metrics_ready.emit(
                     {
                         "frame": frame_idx,
@@ -605,6 +656,7 @@ class InferenceWorker(QThread):
                         "cpu_auto_tuned": cpu_auto_tuned,
                         "processed_frames": detection_stats["frames_processed"],
                         "total_frames": total_frames or max_frames or 0,
+                        "guardrail_debug_html": guardrail_debug_html,
                     }
                 )
 
@@ -641,7 +693,7 @@ class InferenceWorker(QThread):
             "pose_device": pose_runtime.get("device"),
             "pose_weights": pose_runtime.get("weights_path"),
             "action_backend": action_backend,
-            "action_fast_mode": action_fast_mode,
+            "action_fast_mode": action_fast_mode_used,
             "cpu_auto_tuned": cpu_auto_tuned,
             "output_path": str(output_path) if output_path else None,
             "stopped": self._stop_requested,
@@ -841,6 +893,17 @@ class MainWindow(QMainWindow):
         self.smooth_window_spin.setValue(3)
         self.fall_conf_boost_spin = self._make_double_spin(0.00, 0.30, 0.10, 0.01)
         self.sitting_conf_penalty_spin = self._make_double_spin(0.00, 0.40, 0.20, 0.01)
+        self.keypoint_integrity_spin = self._make_double_spin(0.50, 0.95, 0.70, 0.01)
+        self.keypoint_jitter_spin = self._make_double_spin(0.05, 0.40, 0.15, 0.01)
+        self.fall_priority_prob_spin = self._make_double_spin(0.20, 0.80, 0.40, 0.01)
+        self.fall_velocity_ratio_spin = self._make_double_spin(0.05, 0.30, 0.12, 0.01)
+        self.sitting_hold_frames_spin = QSpinBox()
+        self.sitting_hold_frames_spin.setRange(1, 12)
+        self.sitting_hold_frames_spin.setValue(5)
+        self.track_time_budget_spin = self._make_double_spin(2.0, 30.0, 10.0, 0.5)
+        self.fast_track_threshold_spin = QSpinBox()
+        self.fast_track_threshold_spin.setRange(1, 20)
+        self.fast_track_threshold_spin.setValue(5)
 
         action_group = QGroupBox("Action Recognition")
         action_form = QFormLayout(action_group)
@@ -850,6 +913,13 @@ class MainWindow(QMainWindow):
         action_form.addRow("Smoothing Window", self.smooth_window_spin)
         action_form.addRow("Fast Fall Sensitivity", self.fall_conf_boost_spin)
         action_form.addRow("Sitting Strictness", self.sitting_conf_penalty_spin)
+        action_form.addRow("Keypoint Integrity", self.keypoint_integrity_spin)
+        action_form.addRow("Keypoint Jitter Limit", self.keypoint_jitter_spin)
+        action_form.addRow("Fall Priority Prob", self.fall_priority_prob_spin)
+        action_form.addRow("Fall Velocity Limit", self.fall_velocity_ratio_spin)
+        action_form.addRow("Sitting Hold Frames", self.sitting_hold_frames_spin)
+        action_form.addRow("Track Budget ms", self.track_time_budget_spin)
+        action_form.addRow("Fast Mode ID Limit", self.fast_track_threshold_spin)
         control_layout.addWidget(action_group)
 
         preset_group = QGroupBox("Profiles")
@@ -918,6 +988,11 @@ class MainWindow(QMainWindow):
         self.summary_browser.setPlaceholderText("Run summary will appear here.")
         right_layout.addWidget(self.summary_browser, stretch=2)
 
+        self.guardrail_browser = QTextBrowser()
+        self.guardrail_browser.setOpenExternalLinks(False)
+        self.guardrail_browser.setPlaceholderText("Live guardrail diagnostics will appear here.")
+        right_layout.addWidget(self.guardrail_browser, stretch=2)
+
         self.log_output = QTextEdit()
         self.log_output.setReadOnly(True)
         right_layout.addWidget(self.log_output, stretch=2)
@@ -984,6 +1059,13 @@ class MainWindow(QMainWindow):
             smooth_window=int(self.smooth_window_spin.value()),
             fall_conf_boost=float(self.fall_conf_boost_spin.value()),
             sitting_conf_penalty=float(self.sitting_conf_penalty_spin.value()),
+            keypoint_integrity_ratio=float(self.keypoint_integrity_spin.value()),
+            keypoint_jitter_ratio=float(self.keypoint_jitter_spin.value()),
+            fall_priority_prob=float(self.fall_priority_prob_spin.value()),
+            fall_velocity_ratio=float(self.fall_velocity_ratio_spin.value()),
+            sitting_hold_frames=int(self.sitting_hold_frames_spin.value()),
+            track_time_budget_ms=float(self.track_time_budget_spin.value()),
+            fast_track_threshold=int(self.fast_track_threshold_spin.value()),
         )
 
     def _set_running(self, running: bool) -> None:
@@ -1011,6 +1093,13 @@ class MainWindow(QMainWindow):
             self.smooth_window_spin.setValue(3)
             self.fall_conf_boost_spin.setValue(0.10)
             self.sitting_conf_penalty_spin.setValue(0.20)
+            self.keypoint_integrity_spin.setValue(0.70)
+            self.keypoint_jitter_spin.setValue(0.15)
+            self.fall_priority_prob_spin.setValue(0.40)
+            self.fall_velocity_ratio_spin.setValue(0.12)
+            self.sitting_hold_frames_spin.setValue(5)
+            self.track_time_budget_spin.setValue(10.0)
+            self.fast_track_threshold_spin.setValue(5)
         elif profile_name == "fast":
             self.tracker_combo.setCurrentText("ByteTrack (custom)")
             self.det_conf_spin.setValue(0.28)
@@ -1029,6 +1118,13 @@ class MainWindow(QMainWindow):
             self.smooth_window_spin.setValue(3)
             self.fall_conf_boost_spin.setValue(0.10)
             self.sitting_conf_penalty_spin.setValue(0.20)
+            self.keypoint_integrity_spin.setValue(0.68)
+            self.keypoint_jitter_spin.setValue(0.18)
+            self.fall_priority_prob_spin.setValue(0.38)
+            self.fall_velocity_ratio_spin.setValue(0.10)
+            self.sitting_hold_frames_spin.setValue(4)
+            self.track_time_budget_spin.setValue(8.0)
+            self.fast_track_threshold_spin.setValue(5)
         else:
             self.tracker_combo.setCurrentText("BoT-SORT (custom)")
             self.det_conf_spin.setValue(0.30)
@@ -1047,6 +1143,13 @@ class MainWindow(QMainWindow):
             self.smooth_window_spin.setValue(3)
             self.fall_conf_boost_spin.setValue(0.10)
             self.sitting_conf_penalty_spin.setValue(0.20)
+            self.keypoint_integrity_spin.setValue(0.72)
+            self.keypoint_jitter_spin.setValue(0.14)
+            self.fall_priority_prob_spin.setValue(0.42)
+            self.fall_velocity_ratio_spin.setValue(0.12)
+            self.sitting_hold_frames_spin.setValue(5)
+            self.track_time_budget_spin.setValue(12.0)
+            self.fast_track_threshold_spin.setValue(6)
         self.auto_tune_cpu_checkbox.setChecked(True)
         self._append_log(f"Applied profile: {profile_name}")
 
@@ -1072,11 +1175,12 @@ class MainWindow(QMainWindow):
         self.preview_label.setText("Starting...")
         self.log_output.clear()
         self.summary_browser.clear()
+        self.guardrail_browser.clear()
         self.last_output_path = None
         self._append_log("PyQt6 desktop run started.")
 
         self.worker = InferenceWorker(config)
-        self.worker.frame_ready.connect(self._flush_preview_frame)
+        self.worker.frame_ready.connect(self._update_preview_frame)
         self.worker.metrics_ready.connect(self._update_metrics)
         self.worker.status_ready.connect(self._append_log)
         self.worker.finished_ready.connect(self._on_finished)
@@ -1092,25 +1196,19 @@ class MainWindow(QMainWindow):
         self.worker.stop()
         self.stop_btn.setEnabled(False)
 
-    def _update_frame(self, image: QImage) -> None:
-        pixmap = QPixmap.fromImage(image)
-        scaled = pixmap.scaled(
-            self.preview_label.size(),
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.FastTransformation,
-        )
-        self.preview_label.setPixmap(scaled)
-
-    def _flush_preview_frame(self) -> None:
+    def _update_preview_frame(self) -> None:
         worker = self.worker
         if worker is None:
             return
         image = worker.take_latest_preview()
         if image is None:
             return
-        self._update_frame(image)
+        self.preview_label.setPixmap(QPixmap.fromImage(image))
 
     def _update_metrics(self, metrics: dict) -> None:
+        guardrail_debug_html = metrics.get("guardrail_debug_html")
+        if guardrail_debug_html:
+            self.guardrail_browser.setHtml(guardrail_debug_html)
         for key, value in metrics.items():
             label = self.metric_labels.get(key)
             if label is None:
