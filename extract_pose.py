@@ -71,6 +71,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--outdir",  type=str, default=OUTPUT_DIR,     help="Output directory for .npy + metadata")
     p.add_argument("--source",  type=str, default="all",
                    choices=["all", "ur_fall", "multicam"],        help="Which dataset(s) to process")
+    p.add_argument(
+        "--multicam_cams",
+        type=str,
+        default="1",
+        help="Comma-separated cam ids for Multicam (e.g. 1 or 2,3,4 or all)",
+    )
+    p.add_argument(
+        "--multicam_frame_step",
+        type=int,
+        default=1,
+        help="Frame step when extracting each annotated Multicam segment",
+    )
     return p
 
 
@@ -179,7 +191,8 @@ def extract_from_images(model, image_paths: List[str],
 # ─────────────────────────────────────────────────────────────────────────────
 def extract_from_video(model, video_path: str, conf: float,
                        start_frame: Optional[int] = None,
-                       end_frame: Optional[int] = None) -> np.ndarray:
+                       end_frame: Optional[int] = None,
+                       frame_step: int = 1) -> np.ndarray:
     """
     Trích xuất keypoints từ video (tuỳ chọn khoảng frame).
     Returns shape (num_frames, 17, 2).
@@ -197,17 +210,20 @@ def extract_from_video(model, video_path: str, conf: float,
         start_frame = 0
 
     if end_frame is not None:
-        n_frames = max(1, end_frame - start_frame + 1)
+        n_frames_raw = max(1, end_frame - start_frame + 1)
     else:
-        n_frames = total - start_frame
+        n_frames_raw = max(0, total - start_frame)
 
     all_kpts: List[np.ndarray] = []
     prev = np.zeros((17, 2), dtype=np.float32)
+    step = max(1, int(frame_step))
 
-    for _ in tqdm(range(n_frames), desc="    frames", leave=False, unit="f"):
+    for local_idx in tqdm(range(n_frames_raw), desc="    frames", leave=False, unit="f"):
         ret, frame = cap.read()
         if not ret:
             break
+        if local_idx % step != 0:
+            continue
         kpts, prev = _process_frame(model, frame, conf, prev)
         all_kpts.append(kpts)
 
@@ -295,7 +311,29 @@ def _find_multicam_video_root() -> Optional[Path]:
     return None
 
 
-def process_multicam(model, conf: float, output_dir: str) -> List[dict]:
+def _parse_multicam_cams(cams_arg: str, all_cam_values: np.ndarray) -> list[int]:
+    allowed = sorted(int(v) for v in all_cam_values if 1 <= int(v) <= 8)
+    if not allowed:
+        return []
+    raw = str(cams_arg).strip().lower()
+    if raw == "all":
+        return allowed
+
+    selected: list[int] = []
+    for part in raw.split(","):
+        token = part.strip()
+        if not token:
+            continue
+        try:
+            cam = int(token)
+        except ValueError:
+            continue
+        if cam in allowed:
+            selected.append(cam)
+    return sorted(set(selected))
+
+
+def process_multicam(model, conf: float, output_dir: str, cams_arg: str, frame_step: int) -> List[dict]:
     """
     Xử lý Multicam Fall Dataset.
     Dùng data_tuple3.csv để xác định frame range + label cho từng segment.
@@ -316,18 +354,28 @@ def process_multicam(model, conf: float, output_dir: str) -> List[dict]:
     # Đọc CSV annotation
     df = pd.read_csv(csv_path)
     df.columns = df.columns.str.strip()
-    # Lọc cam 1 (hoặc ch1) – tránh duplicate
-    df_cam1 = df[df["cam"] == 1.0].copy()
+    cams = _parse_multicam_cams(cams_arg, df["cam"].dropna().unique())
+    if not cams:
+        print(f"[WARN] Không có cam hợp lệ từ --multicam_cams={cams_arg}")
+        return metadata
+
+    # Lọc theo cam được chọn.
+    df_cam1 = df[df["cam"].isin([float(v) for v in cams])].copy()
     for col in ("chute", "start", "end", "label"):
         df_cam1[col] = df_cam1[col].astype(int)
+    df_cam1["cam"] = df_cam1["cam"].astype(int)
 
     print(f"\n{'='*65}")
-    print(f"  MULTICAM DATASET — {len(df_cam1)} annotated segments (cam1 only)")
+    print(
+        f"  MULTICAM DATASET — {len(df_cam1)} annotated segments "
+        f"(cams={','.join(str(v) for v in cams)}, frame_step={max(1, int(frame_step))})"
+    )
     print(f"{'='*65}")
 
     for _, row in tqdm(df_cam1.iterrows(), total=len(df_cam1),
                        desc="Multicam", unit="seg"):
         chute   = int(row["chute"])
+        cam     = int(row["cam"])
         start   = int(row["start"])
         end     = int(row["end"])
         mc_lbl  = int(row["label"])
@@ -336,16 +384,16 @@ def process_multicam(model, conf: float, output_dir: str) -> List[dict]:
         label_name = LABEL_MAP[label_id]
 
         # Đường dẫn video
-        video_file = video_root / f"chute{chute:02d}" / "cam1.avi"
+        video_file = video_root / f"chute{chute:02d}" / f"cam{cam}.avi"
         if not video_file.exists():
             tqdm.write(f"  [SKIP] Video không tồn tại: {video_file}")
             continue
 
-        action_id = f"chute{chute:02d}_cam1_f{start}-{end}"
+        action_id = f"chute{chute:02d}_cam{cam}_f{start}-{end}"
         tqdm.write(f"  ► {action_id}  |  {end - start + 1} frames  |  {label_name}")
 
         kpts = extract_from_video(model, str(video_file), conf,
-                                  start_frame=start, end_frame=end)
+                                  start_frame=start, end_frame=end, frame_step=frame_step)
         if kpts.shape[0] == 0:
             tqdm.write(f"  [SKIP] Không trích xuất được keypoints: {action_id}")
             continue
@@ -360,6 +408,12 @@ def process_multicam(model, conf: float, output_dir: str) -> List[dict]:
             label_name=label_name,
             label_id=label_id,
             npy_path=npy_path,
+            cam=cam,
+            start_frame=start,
+            end_frame=end,
+            label_raw=mc_lbl,
+            video_path=str(video_file),
+            frame_step=max(1, int(frame_step)),
         ))
         tqdm.write(f"    ✓ {npy_path}  shape={kpts.shape}")
 
@@ -398,7 +452,13 @@ def main():
         print(f"\n  → UR_Fall done: {len(meta_ur)} sequences saved")
 
     if args.source in ("all", "multicam"):
-        meta_mc = process_multicam(model, args.conf, args.outdir)
+        meta_mc = process_multicam(
+            model,
+            args.conf,
+            args.outdir,
+            cams_arg=args.multicam_cams,
+            frame_step=args.multicam_frame_step,
+        )
         all_meta.extend(meta_mc)
         print(f"\n  → Multicam done: {len(meta_mc)} segments saved")
 
@@ -406,8 +466,19 @@ def main():
     print("\n[3/3] Saving metadata CSV ...")
     if all_meta:
         df_out = pd.DataFrame(all_meta,
-                              columns=["source", "action_id", "label_name",
-                                       "label_id", "npy_path"])
+                              columns=[
+                                  "source",
+                                  "action_id",
+                                  "label_name",
+                                  "label_id",
+                                  "npy_path",
+                                  "cam",
+                                  "start_frame",
+                                  "end_frame",
+                                  "label_raw",
+                                  "video_path",
+                                  "frame_step",
+                              ])
         meta_path = os.path.join(args.outdir, METADATA_FILE)
         df_out.to_csv(meta_path, index=False)
 

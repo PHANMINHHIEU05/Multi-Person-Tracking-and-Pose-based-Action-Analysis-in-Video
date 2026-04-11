@@ -42,28 +42,24 @@ from ultralytics import YOLO
 
 # Import model architecture from train_professional_v3
 sys.path.insert(0, str(Path(__file__).parent.parent))
+from src.action_model_common import (
+    DEFAULT_ACTION_LABEL_MAP,
+    EXTRATREES_FEATURE_SPEC_V1,
+    LEGACY_ACTION_LABEL_MAP,
+    build_extratrees_feature_vector,
+    build_label_colors,
+    get_action_color,
+    normalize_label_map,
+)
+from src.runtime_shared import resolve_pose_inference_imgsz
 from train_professional_v3 import ActionRecognitionModel
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Constants
 # ─────────────────────────────────────────────────────────────────────────────
-LABEL_MAP = {
-    0: "Fall",
-    1: "Walking",
-    2: "Sitting_Quickly",
-    3: "Bending",
-    4: "Lying_Down",
-}
-
-# BGR colours per class
-LABEL_COLORS = {
-    0: (0,   0,   255),   # Fall            → red
-    1: (0,   200, 0),     # Walking         → green
-    2: (255, 0,   200),   # Sitting_Quickly → purple
-    3: (255, 140, 0),     # Bending         → orange
-    4: (0,   200, 255),   # Lying_Down      → cyan
-}
+LABEL_MAP = DEFAULT_ACTION_LABEL_MAP.copy()
+LABEL_COLORS = build_label_colors(LABEL_MAP)
 
 SEQ_LEN       = 128    # phải khớp với lúc train
 PRED_STRIDE   = 16     # cập nhật prediction mỗi PRED_STRIDE frame mới
@@ -159,34 +155,6 @@ def prepare_sequence(buffer: deque, seq_len: int = SEQ_LEN) -> np.ndarray:
     return full[np.newaxis].astype(np.float32)             # (1, SEQ_LEN, 69)
 
 
-def build_extratrees_feature_vector(seq69: np.ndarray) -> np.ndarray:
-    """
-    seq69: (T, 69) -> feature vector (759,)
-    Must match train_extratrees_action.py feature engineering.
-    """
-    q25 = np.quantile(seq69, 0.25, axis=0)
-    q75 = np.quantile(seq69, 0.75, axis=0)
-    vel = np.diff(seq69, axis=0)
-
-    feat = np.concatenate(
-        [
-            seq69.mean(axis=0),
-            seq69.std(axis=0),
-            seq69.min(axis=0),
-            seq69.max(axis=0),
-            seq69[0],
-            seq69[-1],
-            (seq69[-1] - seq69[0]),
-            q25,
-            q75,
-            np.mean(np.abs(vel), axis=0),
-            np.std(vel, axis=0),
-        ],
-        axis=0,
-    )
-    return feat.astype(np.float32)
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 #  Action Recognizer
 # ─────────────────────────────────────────────────────────────────────────────
@@ -199,22 +167,23 @@ class ActionRecognizer:
     def __init__(self, model_path: str, device: str = "auto",
                  num_classes: int = 5, hidden_dim: int = 128,
                  num_layers: int = 3, num_heads: int = 8):
-        self.label_map = LABEL_MAP.copy()
+        model_path_l = str(model_path).lower()
+        self.label_map = DEFAULT_ACTION_LABEL_MAP.copy() if model_path_l.endswith(".joblib") else LEGACY_ACTION_LABEL_MAP.copy()
         self.backend = "torch"
         self.et_model = None
         self.model = None
         self.device = torch.device("cpu")
         self.feat_mean: Optional[np.ndarray] = None
         self.feat_std: Optional[np.ndarray] = None
-
-        model_path_l = str(model_path).lower()
+        self.feature_spec = EXTRATREES_FEATURE_SPEC_V1
         if model_path_l.endswith(".joblib"):
             artifact = joblib.load(model_path)
             if isinstance(artifact, dict) and "model" in artifact:
                 self.et_model = artifact["model"]
                 lm = artifact.get("label_map")
                 if isinstance(lm, dict):
-                    self.label_map = {int(k): str(v) for k, v in lm.items()}
+                    self.label_map = normalize_label_map(lm)
+                self.feature_spec = str(artifact.get("feature_spec") or EXTRATREES_FEATURE_SPEC_V1)
             else:
                 self.et_model = artifact
             self.backend = "extratrees"
@@ -225,6 +194,13 @@ class ActionRecognizer:
             else:
                 self.device = torch.device(device)
 
+            checkpoint = torch.load(model_path, map_location=self.device, weights_only=False)
+            if isinstance(checkpoint, dict):
+                lm = checkpoint.get("label_map")
+                if isinstance(lm, dict):
+                    self.label_map = normalize_label_map(lm)
+                num_classes = int(checkpoint.get("num_classes", len(self.label_map)))
+
             self.model = ActionRecognitionModel(
                 input_dim=69,
                 hidden_dim=hidden_dim,
@@ -234,7 +210,6 @@ class ActionRecognizer:
                 dropout=0.0,          # inference: no dropout
             ).to(self.device)
 
-            checkpoint = torch.load(model_path, map_location=self.device, weights_only=False)
             # Checkpoint có thể là dict {model_state_dict: ...} hoặc state_dict thẳng
             if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
                 state = checkpoint["model_state_dict"]
@@ -310,7 +285,7 @@ class ActionRecognizer:
         x = prepare_sequence(self._buffers[track_id])          # (1, 128, 69)
         if self.backend == "extratrees":
             seq69 = x[0]
-            feat = build_extratrees_feature_vector(seq69)[np.newaxis, :]
+            feat = build_extratrees_feature_vector(seq69, feature_spec=self.feature_spec)[np.newaxis, :]
             if hasattr(self.et_model, "predict_proba"):
                 probs = self.et_model.predict_proba(feat)[0]
                 label_id = int(np.argmax(probs))
@@ -494,6 +469,12 @@ def process_video(args):
 
     # ── Tracking config ────────────────────────────────────────────────
     tracker_cfg = args.tracker   # "botsort.yaml" or "bytetrack.yaml"
+    effective_pose_imgsz = resolve_pose_inference_imgsz(args.imgsz, args.pose_model)
+    if effective_pose_imgsz != int(args.imgsz):
+        print(
+            f"[Module C] Pose input size adjusted from {int(args.imgsz)} to {effective_pose_imgsz} "
+            "for the current TensorRT engine."
+        )
 
     frame_idx = 0
     pbar = tqdm(total=max(1, total), desc="Processing", unit="f")
@@ -509,7 +490,7 @@ def process_video(args):
             persist=True,
             conf=args.conf,
             iou=args.iou,
-            imgsz=args.imgsz,
+            imgsz=effective_pose_imgsz,
             max_det=args.max_det,
             classes=[0],          # chỉ detect người
             tracker=tracker_cfg,
@@ -533,7 +514,7 @@ def process_video(args):
 
                 # ── 3. Predict action ──────────────────────────────────
                 label_id, conf, label_name = recognizer.predict(tid)
-                color = LABEL_COLORS.get(label_id, (200, 200, 200))
+                color = get_action_color(label_name, label_id)
 
                 # ── 4. Vẽ lên frame ───────────────────────────────────
                 if args.draw_skeleton and kpts is not None:

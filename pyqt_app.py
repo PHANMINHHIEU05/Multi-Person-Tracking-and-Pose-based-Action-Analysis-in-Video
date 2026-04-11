@@ -41,7 +41,6 @@ from PyQt6.QtWidgets import (
 
 from src.runtime_shared import (
     ActionRecognizerLite,
-    LABEL_COLORS,
     LABEL_MAP,
     ROOT,
     describe_pose_runtime,
@@ -50,8 +49,10 @@ from src.runtime_shared import (
     draw_action_label,
     draw_skeleton,
     extract_kpts_for_track,
+    get_action_color,
     load_pose_model,
     resolve_default_action_model_path,
+    resolve_pose_inference_imgsz,
     resolve_default_pose_weights_path,
     resolve_tracker_config,
 )
@@ -191,6 +192,128 @@ def resolve_visual_draw_state(state: VisualTrackState, target_frame_idx: int) ->
     return bbox if bbox is not None else state.bbox.copy(), kpts, state.label, state.conf, state.color
 
 
+@dataclass
+class ActionBatchTask:
+    task_id: int
+    submitted_at: float
+    track_ids: list[int]
+    feature_matrix: np.ndarray
+
+
+@dataclass
+class ActionBatchResult:
+    task_id: int
+    submitted_at: float
+    track_ids: list[int]
+    probs: Optional[np.ndarray]
+    labels: Optional[np.ndarray]
+    elapsed_ms: float
+    error: Optional[str] = None
+
+
+class AsyncActionPredictor(threading.Thread):
+    def __init__(self, model):
+        super().__init__(daemon=True)
+        self.model = model
+        self._result_queue: queue.Queue[ActionBatchResult] = queue.Queue(maxsize=1)
+        self._stop_event = threading.Event()
+        self._task_condition = threading.Condition()
+        self._latest_task: Optional[ActionBatchTask] = None
+        self._next_task_id = 1
+        self._processing = False
+
+    def is_busy(self) -> bool:
+        with self._task_condition:
+            return self._processing or self._latest_task is not None or not self._result_queue.empty()
+
+    def submit(self, track_ids: list[int], feature_matrix: Optional[np.ndarray]) -> int:
+        if not track_ids or feature_matrix is None or self._stop_event.is_set():
+            return 0
+        with self._task_condition:
+            task = ActionBatchTask(
+                task_id=self._next_task_id,
+                submitted_at=time.perf_counter(),
+                track_ids=list(track_ids),
+                feature_matrix=np.array(feature_matrix, copy=True),
+            )
+            self._next_task_id += 1
+            # Latest-only behavior: replace any pending stale task.
+            self._latest_task = task
+            self._task_condition.notify()
+            return task.task_id
+
+    def poll_result(self) -> Optional[ActionBatchResult]:
+        try:
+            result = self._result_queue.get_nowait()
+        except queue.Empty:
+            return None
+        with self._task_condition:
+            if self._latest_task is None and not self._processing and self._result_queue.empty():
+                self._task_condition.notify_all()
+        return result
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        with self._task_condition:
+            self._latest_task = None
+            self._task_condition.notify_all()
+
+    def _publish_result(self, result: ActionBatchResult) -> None:
+        while not self._stop_event.is_set():
+            try:
+                self._result_queue.put(result, timeout=0.1)
+                return
+            except queue.Full:
+                try:
+                    self._result_queue.get_nowait()
+                except queue.Empty:
+                    pass
+
+    def run(self) -> None:
+        while not self._stop_event.is_set():
+            with self._task_condition:
+                while self._latest_task is None and not self._stop_event.is_set():
+                    self._task_condition.wait(timeout=0.1)
+                if self._stop_event.is_set():
+                    break
+                task = self._latest_task
+                self._latest_task = None
+                self._processing = True
+
+            if task is None:
+                with self._task_condition:
+                    self._processing = False
+                continue
+
+            started_at = time.perf_counter()
+            probs = None
+            labels = None
+            error = None
+            try:
+                if hasattr(self.model, "predict_proba"):
+                    probs = self.model.predict_proba(task.feature_matrix)
+                else:
+                    labels = self.model.predict(task.feature_matrix)
+            except Exception as exc:
+                error = str(exc)
+
+            self._publish_result(
+                ActionBatchResult(
+                    task_id=task.task_id,
+                    submitted_at=task.submitted_at,
+                    track_ids=task.track_ids,
+                    probs=probs,
+                    labels=labels,
+                    elapsed_ms=(time.perf_counter() - started_at) * 1000.0,
+                    error=error,
+                )
+            )
+            with self._task_condition:
+                self._processing = False
+                if self._latest_task is None and self._result_queue.empty():
+                    self._task_condition.notify_all()
+
+
 class InferenceWorker(QThread):
     frame_ready = pyqtSignal()
     metrics_ready = pyqtSignal(dict)
@@ -264,12 +387,18 @@ class InferenceWorker(QThread):
         self.status_ready.emit("Loading pose model...")
         pose_model = load_pose_model_qt(cfg.pose_weights)
         pose_runtime = getattr(pose_model, "_codex_runtime_info", describe_pose_runtime(cfg.pose_weights))
+        effective_pose_imgsz = resolve_pose_inference_imgsz(cfg.imgsz, cfg.pose_weights)
         self.status_ready.emit(
             f"Pose runtime: {pose_runtime.get('backend', 'unknown')} on {pose_runtime.get('device', 'unknown')}"
         )
+        if effective_pose_imgsz != int(cfg.imgsz):
+            self.status_ready.emit(
+                f"Pose input size adjusted from {int(cfg.imgsz)} to {effective_pose_imgsz} for this TensorRT engine."
+            )
 
         self.status_ready.emit("Loading action model...")
         recognizer = self._build_recognizer()
+        action_predictor: Optional[AsyncActionPredictor] = None
 
         tracker_cfg = resolve_tracker_config(cfg.tracker_name)
         fps_src = cap.get(cv2.CAP_PROP_FPS) or 30.0
@@ -283,6 +412,9 @@ class InferenceWorker(QThread):
         effective_max_det = max(1, cfg.max_det)
         effective_target_analysis_fps = max(0.0, cfg.target_analysis_fps)
         cpu_auto_tuned = False
+        if cfg.source_mode == "video" and not cfg.skip_action_model and effective_max_det < 3:
+            effective_max_det = 3
+            self.status_ready.emit("MaxDet raised to 3 for video action runs to reduce missed transition tracks.")
         if cfg.auto_tune_cpu and cpu_only and effective_process_stride < 2:
             effective_process_stride = 2
             cpu_auto_tuned = True
@@ -328,6 +460,11 @@ class InferenceWorker(QThread):
                     recognizer.pred_stride = min_pred_stride
                     current_pred_stride = min_pred_stride
                     cpu_auto_tuned = True
+            if action_backend == "extratrees" and cfg.source_mode == "video" and not cpu_only:
+                if current_pred_stride > 2:
+                    recognizer.pred_stride = 2
+                    current_pred_stride = 2
+                    self.status_ready.emit("Action pred stride lowered to 2 for faster fall transitions on video.")
             effective_action_pred_stride = current_pred_stride
             if cfg.normalize_timing and fps_src > 0:
                 target_action_fps = 8.0 if action_backend == "torch" else 10.0
@@ -337,8 +474,14 @@ class InferenceWorker(QThread):
                 )
             if cfg.auto_tune_cpu and cpu_only and cfg.source_mode == "video":
                 effective_action_update_stride = max(effective_action_update_stride, 3)
-            effective_action_update_stride = max(effective_action_update_stride, 10)
-
+            if action_backend == "extratrees" and cfg.source_mode == "video" and not cpu_only:
+                if effective_action_update_stride > 1:
+                    effective_action_update_stride = 1
+                    self.status_ready.emit("Action update stride forced to 1 for faster fall alerts on video.")
+            if action_backend == "extratrees" and recognizer.et_model is not None:
+                action_predictor = AsyncActionPredictor(recognizer.et_model)
+                action_predictor.start()
+                self.status_ready.emit("Async action inference: enabled")
         output_w = max(1, int(w * cfg.output_scale))
         output_h = max(1, int(h * cfg.output_scale))
 
@@ -372,6 +515,15 @@ class InferenceWorker(QThread):
         t_start = t_prev
         fps_ema = fps_src if fps_src > 0 else 30.0
         action_counts = defaultdict(int)
+        action_request_count = 0
+        action_completed_count = 0
+        action_busy_frames = 0
+        action_last_lag_ms = 0.0
+        action_max_lag_ms = 0.0
+        action_stale_result_count = 0
+        latest_action_task_id = 0
+        latest_action_submitted_at: Optional[float] = None
+        latest_action_task_by_track: dict[int, int] = {}
         detection_stats = {"frames_processed": 0, "frames_with_detections": 0, "total_detections": 0}
         reader: Optional[VideoFrameReader] = None
         if cfg.source_mode == "video":
@@ -387,16 +539,38 @@ class InferenceWorker(QThread):
         unique_stable_ids: set[int] = set()
         next_stable_id = 1
         max_id_idle_frames = max(90, int(round(fps_src * 6.0)))
-        track_hold_frames = max(3, int(round(fps_src * 0.35)))
-        stable_reid_gap = max(8, int(round(fps_src * 0.75)))
-        stable_reid_iou = 0.20
-        stable_reid_dist = 0.75
+        track_hold_frames = max(4, int(round(fps_src * 0.60)))
+        stable_reid_gap = max(12, int(round(fps_src * 1.50)))
+        stable_reid_iou = 0.12
+        stable_reid_dist = 1.10
+        recent_track_count = 0
 
         def resolve_display_id(raw_tid: int, bbox: np.ndarray, assigned_stable_ids: set[int]) -> int:
             nonlocal next_stable_id
             sid = raw_to_stable_id.get(raw_tid)
             if sid is not None:
                 return sid
+
+            # Single-subject continuity fast-path:
+            # if only one subject is visible, keep most recent stable ID to avoid state resets.
+            if recent_track_count <= 1 and not assigned_stable_ids and stable_last_seen:
+                best_recent_sid = None
+                best_recent_gap = 10_000
+                for candidate_sid, last_seen in stable_last_seen.items():
+                    gap = frame_idx - last_seen
+                    if gap < 0:
+                        continue
+                    if gap < best_recent_gap:
+                        best_recent_gap = gap
+                        best_recent_sid = candidate_sid
+                if best_recent_sid is not None and best_recent_gap <= max(stable_reid_gap, int(round(fps_src * 2.0))):
+                    candidate_bbox = stable_last_bbox.get(best_recent_sid)
+                    if candidate_bbox is not None:
+                        iou = bbox_iou_xyxy(bbox, candidate_bbox)
+                        dist = bbox_center_distance_norm(bbox, candidate_bbox)
+                        if iou >= 0.01 or dist <= 1.60:
+                            raw_to_stable_id[raw_tid] = best_recent_sid
+                            return best_recent_sid
 
             best_sid = None
             best_score = -1.0
@@ -410,7 +584,7 @@ class InferenceWorker(QThread):
                 dist = bbox_center_distance_norm(bbox, candidate_bbox)
                 if iou < stable_reid_iou and dist > stable_reid_dist:
                     continue
-                score = iou - 0.35 * dist
+                score = iou - 0.22 * dist
                 if score > best_score:
                     best_score = score
                     best_sid = candidate_sid
@@ -438,6 +612,42 @@ class InferenceWorker(QThread):
                 if max_frames is not None and frame_idx >= max_frames:
                     break
 
+            if action_predictor is not None and recognizer is not None:
+                action_result = action_predictor.poll_result()
+                if action_result is not None:
+                    action_last_lag_ms = (time.perf_counter() - action_result.submitted_at) * 1000.0
+                    action_max_lag_ms = max(action_max_lag_ms, action_last_lag_ms)
+                    action_completed_count += 1
+                    if action_result.task_id == latest_action_task_id:
+                        latest_action_submitted_at = None
+                    if action_result.error:
+                        self.status_ready.emit(f"Async action inference error: {action_result.error}")
+                    else:
+                        valid_positions = [
+                            pos
+                            for pos, track_id in enumerate(action_result.track_ids)
+                            if latest_action_task_by_track.get(track_id, action_result.task_id) == action_result.task_id
+                        ]
+                        dropped_positions = len(action_result.track_ids) - len(valid_positions)
+                        action_stale_result_count += max(0, dropped_positions)
+                        if valid_positions:
+                            valid_track_ids = [action_result.track_ids[pos] for pos in valid_positions]
+                            valid_probs = None
+                            valid_labels = None
+                            if action_result.probs is not None:
+                                valid_probs = action_result.probs[valid_positions]
+                            if action_result.labels is not None:
+                                valid_labels = action_result.labels[valid_positions]
+                            recognizer.apply_batch_prediction_results(
+                                valid_track_ids,
+                                probs=valid_probs,
+                                labels=valid_labels,
+                                elapsed_ms=action_result.elapsed_ms,
+                            )
+                            for track_id in valid_track_ids:
+                                if latest_action_task_by_track.get(track_id) == action_result.task_id:
+                                    latest_action_task_by_track.pop(track_id, None)
+
             detection_stats["frames_processed"] += 1
             visible_ids: set[int] = set()
             recognizer_active_ids: set[int] = set()
@@ -454,21 +664,25 @@ class InferenceWorker(QThread):
                     tracker=tracker_cfg,
                     conf=cfg.det_conf,
                     iou=cfg.det_iou,
-                    imgsz=cfg.imgsz,
+                    imgsz=effective_pose_imgsz,
                     max_det=effective_max_det,
                     classes=[0],
                     half=torch.cuda.is_available(),
                     verbose=False,
                 )
                 result = results[0] if results else None
+                recent_track_count = 0
 
                 if result is not None and result.boxes is not None and result.boxes.id is not None:
                     detection_stats["frames_with_detections"] += 1
                     track_ids = result.boxes.id.cpu().numpy().astype(int)
                     bboxes = result.boxes.xyxy.cpu().numpy()
+                    recent_track_count = int(len(track_ids))
                     if recognizer is not None:
                         recognizer.set_active_track_count(len(track_ids))
                         action_fast_mode_used = action_fast_mode_used or recognizer.is_fast_mode_active()
+                    pending_prediction_ids: list[int] = []
+                    track_entries: list[dict[str, object]] = []
 
                     for i, tid in enumerate(track_ids):
                         raw_tid = int(tid)
@@ -501,19 +715,55 @@ class InferenceWorker(QThread):
                         if recognizer is not None:
                             recognizer.update_track(display_tid, kpts, bbox_norm=bbox_norm)
                             if needs_action_update:
-                                label_id, conf_val, label_name = recognizer.predict(display_tid)
+                                pending_prediction_ids.append(display_tid)
+                        track_entries.append(
+                            {
+                                "display_tid": display_tid,
+                                "bbox": bbox,
+                                "kpts": kpts,
+                                "needs_action_update": needs_action_update if recognizer is not None else False,
+                            }
+                        )
+
+                    batch_predictions: dict[int, Tuple[int, float, str]] = {}
+                    if recognizer is not None and pending_prediction_ids:
+                        if action_predictor is not None:
+                            ready_ids, feature_matrix = recognizer.collect_batch_features(pending_prediction_ids)
+                            if ready_ids:
+                                was_busy = action_predictor.is_busy()
+                                submitted_task_id = action_predictor.submit(ready_ids, feature_matrix)
+                                if submitted_task_id:
+                                    if was_busy:
+                                        action_busy_frames += 1
+                                    recognizer.mark_predictions_submitted(ready_ids)
+                                    action_request_count += 1
+                                    latest_action_task_id = max(latest_action_task_id, submitted_task_id)
+                                    latest_action_submitted_at = time.perf_counter()
+                                    for track_id in ready_ids:
+                                        latest_action_task_by_track[track_id] = submitted_task_id
+                        else:
+                            batch_predictions = recognizer.predict_batch(pending_prediction_ids)
+
+                    for entry in track_entries:
+                        display_tid = int(entry["display_tid"])
+                        bbox = np.asarray(entry["bbox"], dtype=np.float32)
+                        kpts = entry["kpts"]
+
+                        if recognizer is not None:
+                            if bool(entry["needs_action_update"]):
+                                label_id, conf_val, label_name = batch_predictions.get(display_tid, recognizer.get_last_prediction(display_tid))
                             else:
                                 label_id, conf_val, label_name = recognizer.get_last_prediction(display_tid)
                         else:
                             aspect = (bbox[2] - bbox[0]) / max((bbox[3] - bbox[1]), 1e-6)
-                            label_id = 0 if aspect > 1.2 else 1
+                            label_id = 0 if aspect > 1.2 else 2
                             conf_val = 0.50
                             label_name = LABEL_MAP.get(label_id, "Walking")
 
                         if label_name not in ("?", "unknown"):
                             action_counts[label_name] += 1
 
-                        color = LABEL_COLORS.get(label_id, (200, 200, 200))
+                        color = get_action_color(label_name, label_id)
                         existing_state = visual_state_by_id.get(display_tid)
                         prev_bbox = existing_state.bbox.copy() if existing_state is not None else None
                         prev_kpts = existing_state.kpts.copy() if existing_state is not None and existing_state.kpts is not None else None
@@ -582,6 +832,9 @@ class InferenceWorker(QThread):
 
             if recognizer is not None:
                 recognizer.remove_stale_tracks(recognizer_active_ids)
+                stale_pending_track_ids = [track_id for track_id in latest_action_task_by_track if track_id not in recognizer_active_ids]
+                for track_id in stale_pending_track_ids:
+                    latest_action_task_by_track.pop(track_id, None)
 
             if writer is not None:
                 output_frame = frame
@@ -621,24 +874,36 @@ class InferenceWorker(QThread):
                                 f"<td>{debug_state.get('label_name', '?')}</td>"
                                 f"<td>{debug_state.get('confidence', 0.0):.0%}</td>"
                                 f"<td>{debug_state.get('valid_ratio', 0.0):.0%}</td>"
+                                f"<td>{debug_state.get('lower_body_ratio', 0.0):.0%}</td>"
                                 f"<td>{debug_state.get('jitter_ratio', 0.0):.2f}</td>"
                                 f"<td>{debug_state.get('downward_velocity', 0.0):.2f}</td>"
+                                f"<td>{debug_state.get('hip_to_ankle_ratio', 0.0):.2f}</td>"
                                 f"<td>{'Y' if debug_state.get('fall_velocity', False) else 'N'}</td>"
+                                f"<td>{'Y' if debug_state.get('strong_fall_cue', False) else 'N'}</td>"
+                                f"<td>{debug_state.get('pending_fall_frames', 0)}</td>"
+                                f"<td>{debug_state.get('fall_candidate_votes', 0)}</td>"
+                                f"<td>{debug_state.get('fall_recovery_votes', 0)}</td>"
+                                f"<td>{debug_state.get('bbox_aspect_ratio', 1.0):.2f}</td>"
+                                f"<td>{'Y' if debug_state.get('occluded', False) else 'N'}</td>"
                                 f"<td>{'Y' if debug_state.get('noisy', False) else 'N'}</td>"
+                                f"<td>{'Y' if debug_state.get('rescue_applied', False) else 'N'}</td>"
                                 f"<td>{debug_state.get('pending_sitting_frames', 0)}</td>"
                                 f"<td>{debug_state.get('predict_ms', 0.0):.1f}</td>"
+                                f"<td>{'Y' if debug_state.get('overload_track_count', False) else 'N'}</td>"
+                                f"<td>{'Y' if debug_state.get('over_budget_predict', False) else 'N'}</td>"
                                 "</tr>"
                             )
                         guardrail_debug_html = (
                             "<table style='width:100%; border-collapse:collapse;'>"
                             "<thead><tr>"
-                            "<th align='left'>ID</th><th align='left'>Label</th><th align='left'>Conf</th>"
-                            "<th align='left'>Valid</th><th align='left'>Jitter</th><th align='left'>DownVel</th>"
-                            "<th align='left'>FallVel</th><th align='left'>Noisy</th><th align='left'>SitHold</th>"
-                            "<th align='left'>Pred ms</th>"
-                            "</tr></thead><tbody>"
-                            + "".join(rows)
-                            + "</tbody></table>"
+                                "<th align='left'>ID</th><th align='left'>Label</th><th align='left'>Conf</th>"
+                                "<th align='left'>Valid</th><th align='left'>LowerKP</th><th align='left'>Jitter</th><th align='left'>DownVel</th><th align='left'>HipAnk</th>"
+                                "<th align='left'>FallVel</th><th align='left'>FallCue</th><th align='left'>FallHold</th><th align='left'>FallCandV</th><th align='left'>FallRecV</th><th align='left'>BBoxAR</th><th align='left'>Occ</th>"
+                                "<th align='left'>Noisy</th><th align='left'>Rescue</th><th align='left'>SitHold</th>"
+                                "<th align='left'>Pred ms</th><th align='left'>Overload</th><th align='left'>OverBudget</th>"
+                                "</tr></thead><tbody>"
+                                + "".join(rows)
+                                + "</tbody></table>"
                         )
                 self.metrics_ready.emit(
                     {
@@ -648,11 +913,19 @@ class InferenceWorker(QThread):
                         "unique_track_ids": len(unique_stable_ids),
                         "falls": action_counts.get("Fall", 0),
                         "source_fps": fps_src,
+                        "effective_pose_imgsz": effective_pose_imgsz,
                         "effective_process_stride": effective_process_stride,
                         "effective_preview_stride": effective_preview_stride,
                         "effective_action_update_stride": effective_action_update_stride,
                         "effective_action_pred_stride": effective_action_pred_stride or 0,
                         "effective_max_det": effective_max_det,
+                        "action_queue_busy": "Y" if action_predictor is not None and action_predictor.is_busy() else "N",
+                        "action_inflight_ms": (
+                            (time.perf_counter() - latest_action_submitted_at) * 1000.0
+                            if latest_action_submitted_at is not None and action_predictor is not None and action_predictor.is_busy()
+                            else 0.0
+                        ),
+                        "action_max_lag_ms": action_max_lag_ms,
                         "cpu_auto_tuned": cpu_auto_tuned,
                         "processed_frames": detection_stats["frames_processed"],
                         "total_frames": total_frames or max_frames or 0,
@@ -668,6 +941,9 @@ class InferenceWorker(QThread):
             reader.join(timeout=2.0)
         else:
             cap.release()
+        if action_predictor is not None:
+            action_predictor.stop()
+            action_predictor.join(timeout=1.0)
         if writer is not None:
             writer.release()
 
@@ -683,6 +959,7 @@ class InferenceWorker(QThread):
             "fps_live_ema": fps_ema,
             "elapsed_sec": elapsed,
             "source_fps": fps_src,
+            "effective_pose_imgsz": effective_pose_imgsz,
             "effective_preview_stride": effective_preview_stride,
             "effective_max_det": effective_max_det,
             "effective_action_pred_stride": effective_action_pred_stride,
@@ -694,6 +971,12 @@ class InferenceWorker(QThread):
             "pose_weights": pose_runtime.get("weights_path"),
             "action_backend": action_backend,
             "action_fast_mode": action_fast_mode_used,
+            "action_queue_busy_frames": action_busy_frames,
+            "action_request_count": action_request_count,
+            "action_completed_count": action_completed_count,
+            "action_stale_result_count": action_stale_result_count,
+            "action_last_lag_ms": action_last_lag_ms,
+            "action_max_lag_ms": action_max_lag_ms,
             "cpu_auto_tuned": cpu_auto_tuned,
             "output_path": str(output_path) if output_path else None,
             "stopped": self._stop_requested,
@@ -968,11 +1251,15 @@ class MainWindow(QMainWindow):
             ("unique_track_ids", "Unique Track IDs"),
             ("falls", "Falls"),
             ("source_fps", "Source FPS"),
+            ("effective_pose_imgsz", "Pose ImgSz"),
             ("effective_process_stride", "Process Stride"),
             ("effective_preview_stride", "Preview Stride"),
             ("effective_max_det", "Effective MaxDet"),
             ("effective_action_pred_stride", "Action Pred Stride"),
             ("effective_action_update_stride", "Action Update Stride"),
+            ("action_queue_busy", "Action Busy"),
+            ("action_inflight_ms", "Action Lag ms"),
+            ("action_max_lag_ms", "Max Action Lag"),
         ]
         for index, (key, title) in enumerate(metric_names):
             title_label = QLabel(title)
@@ -1246,11 +1533,18 @@ class MainWindow(QMainWindow):
             <b>Total Detections:</b> {summary.get('total_detections', 0)}<br>
             <b>Frames With Detections:</b> {summary.get('frames_with_detections', 0)}<br>
             <b>Source FPS:</b> {summary.get('source_fps', 0):.1f}<br>
+            <b>Effective Pose ImgSz:</b> {summary.get('effective_pose_imgsz', 0)}<br>
             <b>Effective Process Stride:</b> {summary.get('effective_process_stride', 0)}<br>
             <b>Effective Preview Stride:</b> {summary.get('effective_preview_stride', 0)}<br>
             <b>Effective Action Pred Stride:</b> {summary.get('effective_action_pred_stride', 0) or 0}<br>
             <b>Effective Action Update Stride:</b> {summary.get('effective_action_update_stride', 0)}<br>
             <b>Effective MaxDet:</b> {summary.get('effective_max_det', 0)}<br>
+            <b>Action Queue Busy Frames:</b> {summary.get('action_queue_busy_frames', 0)}<br>
+            <b>Action Requests:</b> {summary.get('action_request_count', 0)}<br>
+            <b>Action Completed:</b> {summary.get('action_completed_count', 0)}<br>
+            <b>Action Stale Results Dropped:</b> {summary.get('action_stale_result_count', 0)}<br>
+            <b>Last Action Lag ms:</b> {summary.get('action_last_lag_ms', 0):.1f}<br>
+            <b>Max Action Lag ms:</b> {summary.get('action_max_lag_ms', 0):.1f}<br>
             <b>CPU Auto-Tuned:</b> {summary.get('cpu_auto_tuned', False)}<br>
             <b>Pose Backend:</b> {summary.get('pose_backend') or 'unknown'}<br>
             <b>Pose Device:</b> {summary.get('pose_device') or 'unknown'}<br>
