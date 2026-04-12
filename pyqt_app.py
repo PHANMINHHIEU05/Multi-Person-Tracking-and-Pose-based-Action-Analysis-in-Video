@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 import queue
 import threading
@@ -446,6 +447,17 @@ class InferenceWorker(QThread):
                 action_fast_mode = bool(cfg.auto_tune_cpu and cpu_only and cfg.source_mode == "video")
                 recognizer.fast_mode = action_fast_mode
                 action_fast_mode_used = action_fast_mode
+            # Accuracy-first desktop quality profile (video + GPU): allow denser action cadence.
+            # This keeps the user-selected pred/update stride when explicitly configured for quality.
+            accuracy_first_video = bool(
+                action_backend == "extratrees"
+                and cfg.source_mode == "video"
+                and not cpu_only
+                and int(cfg.process_stride) <= 1
+                and int(cfg.pred_stride) <= 1
+                and not bool(cfg.normalize_timing)
+                and not bool(cfg.auto_tune_cpu)
+            )
             if action_backend == "torch":
                 effective_action_update_stride = 2 if cfg.source_mode == "webcam" else 3
             else:
@@ -461,11 +473,24 @@ class InferenceWorker(QThread):
                     current_pred_stride = min_pred_stride
                     cpu_auto_tuned = True
             if action_backend == "extratrees" and cfg.source_mode == "video" and not cpu_only:
-                if current_pred_stride > 2:
-                    recognizer.pred_stride = 2
-                    current_pred_stride = 2
-                    self.status_ready.emit("Action pred stride lowered to 2 for faster fall transitions on video.")
+                # Keep ET cadence stable on GPU video to avoid async queue thrashing.
+                target_pred_stride = 1 if accuracy_first_video else 2
+                if current_pred_stride < target_pred_stride:
+                    recognizer.pred_stride = target_pred_stride
+                    current_pred_stride = target_pred_stride
+                    self.status_ready.emit(
+                        f"Action pred stride raised to {target_pred_stride} for stable async inference on video."
+                    )
+                elif current_pred_stride > target_pred_stride:
+                    recognizer.pred_stride = target_pred_stride
+                    current_pred_stride = target_pred_stride
+                    self.status_ready.emit(
+                        f"Action pred stride lowered to {target_pred_stride} for faster fall transitions on video."
+                    )
             effective_action_pred_stride = current_pred_stride
+            if accuracy_first_video and effective_action_update_stride > 1:
+                effective_action_update_stride = 1
+                self.status_ready.emit("Action update stride set to 1 for accuracy-first video quality mode.")
             if cfg.normalize_timing and fps_src > 0:
                 target_action_fps = 8.0 if action_backend == "torch" else 10.0
                 effective_action_update_stride = max(
@@ -475,21 +500,26 @@ class InferenceWorker(QThread):
             if cfg.auto_tune_cpu and cpu_only and cfg.source_mode == "video":
                 effective_action_update_stride = max(effective_action_update_stride, 3)
             if action_backend == "extratrees" and cfg.source_mode == "video" and not cpu_only:
-                if effective_action_update_stride > 1:
-                    effective_action_update_stride = 1
-                    self.status_ready.emit("Action update stride forced to 1 for faster fall alerts on video.")
+                # ET worker typically returns in ~30-60ms. Updating every frame on 24+ FPS
+                # floods the pipeline and causes stale drops; keep a safer cadence.
+                floor_stride = 1 if accuracy_first_video else (3 if effective_max_det >= 20 else 2)
+                if effective_action_update_stride < floor_stride:
+                    effective_action_update_stride = floor_stride
+                    self.status_ready.emit(
+                        f"Action update stride raised to {floor_stride} to reduce stale async results."
+                    )
             if action_backend == "extratrees" and recognizer.et_model is not None:
                 action_predictor = AsyncActionPredictor(recognizer.et_model)
                 action_predictor.start()
                 self.status_ready.emit("Async action inference: enabled")
         output_w = max(1, int(w * cfg.output_scale))
         output_h = max(1, int(h * cfg.output_scale))
+        run_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
 
         output_path = None
         writer = None
         if cfg.source_mode == "video" and cfg.save_output_video and w > 0 and h > 0:
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            output_path = OUTPUT_DIR / f"{output_stem}_{ts}_qt_annotated.mp4"
+            output_path = OUTPUT_DIR / f"{output_stem}_{run_ts}_qt_annotated.mp4"
             preferred_mp4 = output_path
             fallback_avi = output_path.with_suffix(".avi")
             for candidate_path, codecs in [
@@ -518,6 +548,7 @@ class InferenceWorker(QThread):
         action_request_count = 0
         action_completed_count = 0
         action_busy_frames = 0
+        action_skipped_busy_count = 0
         action_last_lag_ms = 0.0
         action_max_lag_ms = 0.0
         action_stale_result_count = 0
@@ -541,9 +572,26 @@ class InferenceWorker(QThread):
         max_id_idle_frames = max(90, int(round(fps_src * 6.0)))
         track_hold_frames = max(4, int(round(fps_src * 0.60)))
         stable_reid_gap = max(12, int(round(fps_src * 1.50)))
-        stable_reid_iou = 0.12
-        stable_reid_dist = 1.10
+        stable_reid_iou = 0.14
+        stable_reid_dist = 0.85
         recent_track_count = 0
+        # Scene-cut logic tuned to avoid over-resetting on motion-heavy clips.
+        # We still detect hard transitions, but require stronger evidence + debounce.
+        scene_stride_factor = max(1.0, float(effective_process_stride))
+        scene_cut_diff_threshold = 4.4 + 0.4 * (scene_stride_factor - 1.0)
+        scene_cut_min_gap = max(14, int(round(fps_src * 0.60)))
+        scene_cut_pixel_delta_threshold = 20.0
+        scene_cut_pixel_change_ratio = 0.13
+        last_scene_cut_frame = -10_000
+        prev_scene_signature: Optional[np.ndarray] = None
+        prev_scene_diff = 0.0
+        scene_cut_reset_count = 0
+        track_jump_vote_count = 0
+        timeline_records: list[dict[str, object]] = []
+        timeline_transitions: list[dict[str, object]] = []
+        timeline_label_counts: dict[str, int] = defaultdict(int)
+        timeline_last_label_by_tid: dict[int, str] = {}
+        timeline_path: Optional[Path] = None
 
         def resolve_display_id(raw_tid: int, bbox: np.ndarray, assigned_stable_ids: set[int]) -> int:
             nonlocal next_stable_id
@@ -553,6 +601,7 @@ class InferenceWorker(QThread):
 
             # Single-subject continuity fast-path:
             # if only one subject is visible, keep most recent stable ID to avoid state resets.
+            # Keep this path conservative to avoid carrying labels across quick scene transitions.
             if recent_track_count <= 1 and not assigned_stable_ids and stable_last_seen:
                 best_recent_sid = None
                 best_recent_gap = 10_000
@@ -563,14 +612,30 @@ class InferenceWorker(QThread):
                     if gap < best_recent_gap:
                         best_recent_gap = gap
                         best_recent_sid = candidate_sid
-                if best_recent_sid is not None and best_recent_gap <= max(stable_reid_gap, int(round(fps_src * 2.0))):
+                single_subject_gap_limit = max(6, int(round(fps_src * 0.40)))
+                if best_recent_sid is not None and best_recent_gap <= single_subject_gap_limit:
                     candidate_bbox = stable_last_bbox.get(best_recent_sid)
                     if candidate_bbox is not None:
                         iou = bbox_iou_xyxy(bbox, candidate_bbox)
                         dist = bbox_center_distance_norm(bbox, candidate_bbox)
-                        if iou >= 0.01 or dist <= 1.60:
-                            raw_to_stable_id[raw_tid] = best_recent_sid
-                            return best_recent_sid
+                        candidate_w = max(float(candidate_bbox[2] - candidate_bbox[0]), 1e-3)
+                        candidate_h = max(float(candidate_bbox[3] - candidate_bbox[1]), 1e-3)
+                        curr_w = max(float(bbox[2] - bbox[0]), 1e-3)
+                        curr_h = max(float(bbox[3] - bbox[1]), 1e-3)
+                        area_ratio = (curr_w * curr_h) / max(candidate_w * candidate_h, 1e-3)
+
+                        prev_sensitive = False
+                        if recognizer is not None:
+                            _, _, prev_label_name = recognizer.get_last_prediction(best_recent_sid)
+                            prev_sensitive = prev_label_name in {"Fall", "Lying_Down"}
+
+                        likely_scene_jump = area_ratio < 0.62 or area_ratio > 1.62
+                        strong_overlap = iou >= 0.08 and 0.60 <= area_ratio <= 1.65
+                        close_motion = dist <= 0.45 and 0.72 <= area_ratio <= 1.38
+                        if not likely_scene_jump and (strong_overlap or close_motion):
+                            if not (prev_sensitive and iou < 0.14 and dist > 0.38):
+                                raw_to_stable_id[raw_tid] = best_recent_sid
+                                return best_recent_sid
 
             best_sid = None
             best_score = -1.0
@@ -626,7 +691,7 @@ class InferenceWorker(QThread):
                         valid_positions = [
                             pos
                             for pos, track_id in enumerate(action_result.track_ids)
-                            if latest_action_task_by_track.get(track_id, action_result.task_id) == action_result.task_id
+                            if latest_action_task_by_track.get(track_id) == action_result.task_id
                         ]
                         dropped_positions = len(action_result.track_ids) - len(valid_positions)
                         action_stale_result_count += max(0, dropped_positions)
@@ -657,6 +722,48 @@ class InferenceWorker(QThread):
             should_draw_this_frame = (writer is not None) or preview_emit_due
 
             if should_process_frame:
+                scene_cut_diff = 0.0
+                scene_cut_change_ratio = 0.0
+                scene_cut_detected = False
+                try:
+                    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                    scene_signature = cv2.resize(gray, (64, 36), interpolation=cv2.INTER_AREA)
+                except Exception:
+                    scene_signature = None
+                if scene_signature is not None:
+                    if prev_scene_signature is not None:
+                        scene_abs_diff = cv2.absdiff(scene_signature, prev_scene_signature)
+                        scene_cut_diff = float(np.mean(scene_abs_diff))
+                        scene_cut_change_ratio = float(np.mean(scene_abs_diff >= scene_cut_pixel_delta_threshold))
+                        cut_like_spike = (
+                            scene_cut_diff >= max(scene_cut_diff_threshold, prev_scene_diff * 1.28)
+                            and scene_cut_change_ratio >= scene_cut_pixel_change_ratio
+                        )
+                        hard_cut = (
+                            scene_cut_diff >= (scene_cut_diff_threshold * 1.65)
+                            and scene_cut_change_ratio >= (scene_cut_pixel_change_ratio * 0.92)
+                        )
+                        if (cut_like_spike or hard_cut) and (frame_idx - last_scene_cut_frame) >= scene_cut_min_gap:
+                            scene_cut_detected = True
+                        prev_scene_diff = scene_cut_diff
+                    prev_scene_signature = scene_signature
+
+                if scene_cut_detected:
+                    last_scene_cut_frame = frame_idx
+                    scene_cut_reset_count += 1
+                    track_jump_vote_count = 0
+                    raw_to_stable_id.clear()
+                    raw_last_seen.clear()
+                    stable_last_bbox.clear()
+                    stable_last_seen.clear()
+                    visual_state_by_id.clear()
+                    latest_action_task_by_track.clear()
+                    if recognizer is not None:
+                        recognizer.remove_stale_tracks(set())
+                    self.status_ready.emit(
+                        f"Scene cut reset at frame {frame_idx} (diff={scene_cut_diff:.1f})"
+                    )
+
                 assigned_stable_ids: set[int] = set()
                 results = pose_model.track(
                     frame,
@@ -678,6 +785,71 @@ class InferenceWorker(QThread):
                     track_ids = result.boxes.id.cpu().numpy().astype(int)
                     bboxes = result.boxes.xyxy.cpu().numpy()
                     recent_track_count = int(len(track_ids))
+                    # Track-jump scene-cut fallback with debounce:
+                    # trigger only when overlap collapses for consecutive processed frames.
+                    track_jump_candidate = False
+                    if (
+                        not scene_cut_detected
+                        and stable_last_bbox
+                        and len(track_ids) >= 4
+                        and (frame_idx - last_scene_cut_frame) >= scene_cut_min_gap
+                    ):
+                        recent_prev_bboxes = [
+                            candidate_bbox
+                            for candidate_sid, candidate_bbox in stable_last_bbox.items()
+                            if (frame_idx - stable_last_seen.get(candidate_sid, -10_000))
+                            <= max(4, int(round(effective_process_stride + 2)))
+                        ]
+                        if len(recent_prev_bboxes) >= 4:
+                            low_overlap = 0
+                            far_shift = 0
+                            for curr_bbox in bboxes:
+                                best_iou = 0.0
+                                best_dist = 10.0
+                                for prev_bbox in recent_prev_bboxes:
+                                    iou_val = bbox_iou_xyxy(curr_bbox, prev_bbox)
+                                    dist_val = bbox_center_distance_norm(curr_bbox, prev_bbox)
+                                    if iou_val > best_iou:
+                                        best_iou = iou_val
+                                    if dist_val < best_dist:
+                                        best_dist = dist_val
+                                if best_iou < 0.02:
+                                    low_overlap += 1
+                                if best_dist > 0.70:
+                                    far_shift += 1
+                            low_overlap_ratio = low_overlap / max(len(bboxes), 1)
+                            far_shift_ratio = far_shift / max(len(bboxes), 1)
+                            track_jump_candidate = (
+                                low_overlap_ratio >= 0.92
+                                and far_shift_ratio >= 0.82
+                                and scene_cut_change_ratio >= (scene_cut_pixel_change_ratio * 0.60)
+                            )
+
+                    if track_jump_candidate:
+                        track_jump_vote_count = min(track_jump_vote_count + 1, 3)
+                    else:
+                        track_jump_vote_count = max(track_jump_vote_count - 1, 0)
+
+                    if (
+                        not scene_cut_detected
+                        and track_jump_vote_count >= 2
+                        and (frame_idx - last_scene_cut_frame) >= scene_cut_min_gap
+                    ):
+                        scene_cut_detected = True
+                        last_scene_cut_frame = frame_idx
+                        scene_cut_reset_count += 1
+                        track_jump_vote_count = 0
+                        raw_to_stable_id.clear()
+                        raw_last_seen.clear()
+                        stable_last_bbox.clear()
+                        stable_last_seen.clear()
+                        visual_state_by_id.clear()
+                        latest_action_task_by_track.clear()
+                        if recognizer is not None:
+                            recognizer.remove_stale_tracks(set())
+                        self.status_ready.emit(
+                            f"Scene cut reset at frame {frame_idx} (track-jump)"
+                        )
                     if recognizer is not None:
                         recognizer.set_active_track_count(len(track_ids))
                         action_fast_mode_used = action_fast_mode_used or recognizer.is_fast_mode_active()
@@ -692,6 +864,24 @@ class InferenceWorker(QThread):
                         display_tid = resolve_display_id(raw_tid, bbox, assigned_stable_ids)
                         assigned_stable_ids.add(display_tid)
                         unique_stable_ids.add(display_tid)
+                        prev_display_bbox = stable_last_bbox.get(display_tid)
+                        prev_display_seen = stable_last_seen.get(display_tid, -10_000)
+                        if recognizer is not None and prev_display_bbox is not None and frame_idx > prev_display_seen:
+                            prev_w = max(float(prev_display_bbox[2] - prev_display_bbox[0]), 1e-3)
+                            prev_h = max(float(prev_display_bbox[3] - prev_display_bbox[1]), 1e-3)
+                            curr_w = max(float(bbox[2] - bbox[0]), 1e-3)
+                            curr_h = max(float(bbox[3] - bbox[1]), 1e-3)
+                            area_ratio = (curr_w * curr_h) / max(prev_w * prev_h, 1e-3)
+                            iou = bbox_iou_xyxy(bbox, prev_display_bbox)
+                            dist = bbox_center_distance_norm(bbox, prev_display_bbox)
+                            _, _, prev_label_name = recognizer.get_last_prediction(display_tid)
+                            carryover_sensitive = prev_label_name in {"Fall", "Lying_Down"}
+                            hard_cut_jump = iou < 0.05 and (dist > 0.55 or area_ratio < 0.55 or area_ratio > 1.90)
+                            extreme_jump = dist > 0.95
+                            if hard_cut_jump or (carryover_sensitive and extreme_jump):
+                                recognizer.reset_track(display_tid)
+                                latest_action_task_by_track.pop(display_tid, None)
+                                visual_state_by_id.pop(display_tid, None)
                         raw_last_seen[raw_tid] = frame_idx
                         stable_last_bbox[display_tid] = bbox.copy()
                         stable_last_seen[display_tid] = frame_idx
@@ -731,16 +921,19 @@ class InferenceWorker(QThread):
                             ready_ids, feature_matrix = recognizer.collect_batch_features(pending_prediction_ids)
                             if ready_ids:
                                 was_busy = action_predictor.is_busy()
-                                submitted_task_id = action_predictor.submit(ready_ids, feature_matrix)
-                                if submitted_task_id:
-                                    if was_busy:
-                                        action_busy_frames += 1
-                                    recognizer.mark_predictions_submitted(ready_ids)
-                                    action_request_count += 1
-                                    latest_action_task_id = max(latest_action_task_id, submitted_task_id)
-                                    latest_action_submitted_at = time.perf_counter()
-                                    for track_id in ready_ids:
-                                        latest_action_task_by_track[track_id] = submitted_task_id
+                                if was_busy:
+                                    # Backpressure: keep latest in-flight batch, don't flood the queue.
+                                    action_busy_frames += 1
+                                    action_skipped_busy_count += 1
+                                else:
+                                    submitted_task_id = action_predictor.submit(ready_ids, feature_matrix)
+                                    if submitted_task_id:
+                                        recognizer.mark_predictions_submitted(ready_ids)
+                                        action_request_count += 1
+                                        latest_action_task_id = max(latest_action_task_id, submitted_task_id)
+                                        latest_action_submitted_at = time.perf_counter()
+                                        for track_id in ready_ids:
+                                            latest_action_task_by_track[track_id] = submitted_task_id
                         else:
                             batch_predictions = recognizer.predict_batch(pending_prediction_ids)
 
@@ -759,6 +952,30 @@ class InferenceWorker(QThread):
                             label_id = 0 if aspect > 1.2 else 2
                             conf_val = 0.50
                             label_name = LABEL_MAP.get(label_id, "Walking")
+
+                        if recognizer is not None and cfg.source_mode == "video":
+                            debug_state = recognizer.get_debug_state(display_tid)
+                            timeline_label = label_name if label_name not in ("", "unknown") else "?"
+                            rec = {
+                                "frame": int(frame_idx),
+                                "sec": float(frame_idx / max(float(fps_src), 1e-6)),
+                                "tid": int(display_tid),
+                                "label": str(timeline_label),
+                                "conf": float(conf_val),
+                                "fall_cue": bool(debug_state.get("strong_fall_cue", False)),
+                                "fall_vel": bool(debug_state.get("fall_velocity", False)),
+                                "fall_hold": int(debug_state.get("pending_fall_frames", 0)),
+                                "fall_recovery_votes": int(debug_state.get("fall_recovery_votes", 0)),
+                                "down_vel": float(debug_state.get("downward_velocity", 0.0)),
+                                "bbox_ar": float(debug_state.get("bbox_aspect_ratio", 1.0)),
+                                "resc": str(debug_state.get("rescue_reason", "")),
+                            }
+                            timeline_records.append(rec)
+                            timeline_label_counts[timeline_label] += 1
+                            prev_timeline_label = timeline_last_label_by_tid.get(display_tid)
+                            if prev_timeline_label != timeline_label:
+                                timeline_transitions.append(dict(rec))
+                                timeline_last_label_by_tid[display_tid] = timeline_label
 
                         if label_name not in ("?", "unknown"):
                             action_counts[label_name] += 1
@@ -919,6 +1136,8 @@ class InferenceWorker(QThread):
                         "effective_action_update_stride": effective_action_update_stride,
                         "effective_action_pred_stride": effective_action_pred_stride or 0,
                         "effective_max_det": effective_max_det,
+                        "scene_cut_resets": scene_cut_reset_count,
+                        "action_skipped_busy_count": action_skipped_busy_count,
                         "action_queue_busy": "Y" if action_predictor is not None and action_predictor.is_busy() else "N",
                         "action_inflight_ms": (
                             (time.perf_counter() - latest_action_submitted_at) * 1000.0
@@ -949,6 +1168,21 @@ class InferenceWorker(QThread):
 
         elapsed = max(time.time() - t_start, 1e-6)
         fps_avg = frame_idx / elapsed if frame_idx > 0 else 0.0
+        if cfg.source_mode == "video" and recognizer is not None:
+            device_tag = str(pose_runtime.get("device") or "unknown").replace("/", "_").replace(":", "_")
+            timeline_path = OUTPUT_DIR / f"fall_debug_timeline_{device_tag}_{run_ts}.json"
+            timeline_payload = {
+                "label_counts": dict(timeline_label_counts),
+                "records": timeline_records,
+                "transitions": timeline_transitions,
+            }
+            try:
+                with timeline_path.open("w", encoding="utf-8") as f:
+                    json.dump(timeline_payload, f, ensure_ascii=False)
+                self.status_ready.emit(f"Saved fall debug timeline: {timeline_path}")
+            except Exception as exc:
+                self.status_ready.emit(f"Failed to save fall debug timeline: {exc}")
+                timeline_path = None
         return {
             "source_mode": cfg.source_mode,
             "processed_frames": detection_stats["frames_processed"],
@@ -962,6 +1196,7 @@ class InferenceWorker(QThread):
             "effective_pose_imgsz": effective_pose_imgsz,
             "effective_preview_stride": effective_preview_stride,
             "effective_max_det": effective_max_det,
+            "scene_cut_resets": scene_cut_reset_count,
             "effective_action_pred_stride": effective_action_pred_stride,
             "effective_process_stride": effective_process_stride,
             "effective_action_update_stride": effective_action_update_stride,
@@ -972,6 +1207,7 @@ class InferenceWorker(QThread):
             "action_backend": action_backend,
             "action_fast_mode": action_fast_mode_used,
             "action_queue_busy_frames": action_busy_frames,
+            "action_skipped_busy_count": action_skipped_busy_count,
             "action_request_count": action_request_count,
             "action_completed_count": action_completed_count,
             "action_stale_result_count": action_stale_result_count,
@@ -979,6 +1215,7 @@ class InferenceWorker(QThread):
             "action_max_lag_ms": action_max_lag_ms,
             "cpu_auto_tuned": cpu_auto_tuned,
             "output_path": str(output_path) if output_path else None,
+            "fall_debug_timeline_path": str(timeline_path) if timeline_path else None,
             "stopped": self._stop_requested,
             "action_counts": dict(action_counts),
         }
@@ -1052,6 +1289,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("PyQt6 Fall Detection & Action Recognition")
         self.resize(1560, 920)
         self._build_ui()
+        self._apply_profile("quality")
         self._sync_source_mode()
         self._sync_normalize_timing()
 
@@ -1257,6 +1495,7 @@ class MainWindow(QMainWindow):
             ("effective_max_det", "Effective MaxDet"),
             ("effective_action_pred_stride", "Action Pred Stride"),
             ("effective_action_update_stride", "Action Update Stride"),
+            ("scene_cut_resets", "Scene Cut Resets"),
             ("action_queue_busy", "Action Busy"),
             ("action_inflight_ms", "Action Lag ms"),
             ("action_max_lag_ms", "Max Action Lag"),
@@ -1376,17 +1615,19 @@ class MainWindow(QMainWindow):
             self.normalize_timing_checkbox.setChecked(True)
             self.target_analysis_fps_spin.setValue(12.0)
             self.pred_stride_spin.setValue(3)
+            self.min_track_frames_spin.setValue(9)
             self.action_conf_spin.setValue(0.30)
             self.smooth_window_spin.setValue(3)
-            self.fall_conf_boost_spin.setValue(0.10)
+            self.fall_conf_boost_spin.setValue(0.08)
             self.sitting_conf_penalty_spin.setValue(0.20)
             self.keypoint_integrity_spin.setValue(0.70)
             self.keypoint_jitter_spin.setValue(0.15)
-            self.fall_priority_prob_spin.setValue(0.40)
+            self.fall_priority_prob_spin.setValue(0.44)
             self.fall_velocity_ratio_spin.setValue(0.12)
             self.sitting_hold_frames_spin.setValue(5)
             self.track_time_budget_spin.setValue(10.0)
             self.fast_track_threshold_spin.setValue(5)
+            self.auto_tune_cpu_checkbox.setChecked(True)
         elif profile_name == "fast":
             self.tracker_combo.setCurrentText("ByteTrack (custom)")
             self.det_conf_spin.setValue(0.28)
@@ -1401,43 +1642,49 @@ class MainWindow(QMainWindow):
             self.normalize_timing_checkbox.setChecked(True)
             self.target_analysis_fps_spin.setValue(10.0)
             self.pred_stride_spin.setValue(4)
-            self.action_conf_spin.setValue(0.30)
+            self.min_track_frames_spin.setValue(8)
+            self.action_conf_spin.setValue(0.31)
             self.smooth_window_spin.setValue(3)
-            self.fall_conf_boost_spin.setValue(0.10)
+            self.fall_conf_boost_spin.setValue(0.08)
             self.sitting_conf_penalty_spin.setValue(0.20)
             self.keypoint_integrity_spin.setValue(0.68)
             self.keypoint_jitter_spin.setValue(0.18)
-            self.fall_priority_prob_spin.setValue(0.38)
+            self.fall_priority_prob_spin.setValue(0.42)
             self.fall_velocity_ratio_spin.setValue(0.10)
             self.sitting_hold_frames_spin.setValue(4)
             self.track_time_budget_spin.setValue(8.0)
             self.fast_track_threshold_spin.setValue(5)
+            self.auto_tune_cpu_checkbox.setChecked(True)
         else:
             self.tracker_combo.setCurrentText("BoT-SORT (custom)")
-            self.det_conf_spin.setValue(0.30)
+            pose_pt = ROOT / "yolov8n-pose.pt"
+            if pose_pt.exists():
+                self.pose_weights_edit.setText(str(pose_pt))
+            self.det_conf_spin.setValue(0.25)
             self.det_iou_spin.setValue(0.50)
             self.imgsz_combo.setCurrentText("960")
-            self.max_det_spin.setValue(100)
+            self.max_det_spin.setValue(16)
             self.live_preview_checkbox.setChecked(True)
             self.process_stride_spin.setValue(1)
-            self.preview_stride_spin.setValue(2)
+            self.preview_stride_spin.setValue(1)
             self.output_scale_combo.setCurrentText("1.0")
             self.save_output_checkbox.setChecked(True)
             self.normalize_timing_checkbox.setChecked(False)
             self.target_analysis_fps_spin.setValue(12.0)
             self.pred_stride_spin.setValue(1)
+            self.min_track_frames_spin.setValue(8)
             self.action_conf_spin.setValue(0.30)
-            self.smooth_window_spin.setValue(3)
+            self.smooth_window_spin.setValue(2)
             self.fall_conf_boost_spin.setValue(0.10)
-            self.sitting_conf_penalty_spin.setValue(0.20)
-            self.keypoint_integrity_spin.setValue(0.72)
-            self.keypoint_jitter_spin.setValue(0.14)
-            self.fall_priority_prob_spin.setValue(0.42)
+            self.sitting_conf_penalty_spin.setValue(0.22)
+            self.keypoint_integrity_spin.setValue(0.68)
+            self.keypoint_jitter_spin.setValue(0.18)
+            self.fall_priority_prob_spin.setValue(0.46)
             self.fall_velocity_ratio_spin.setValue(0.12)
             self.sitting_hold_frames_spin.setValue(5)
             self.track_time_budget_spin.setValue(12.0)
             self.fast_track_threshold_spin.setValue(6)
-        self.auto_tune_cpu_checkbox.setChecked(True)
+            self.auto_tune_cpu_checkbox.setChecked(False)
         self._append_log(f"Applied profile: {profile_name}")
 
     def _open_output(self) -> None:
@@ -1515,6 +1762,8 @@ class MainWindow(QMainWindow):
         self.open_output_btn.setEnabled(bool(self.last_output_path))
         if summary.get("output_path"):
             self._append_log(f"Output video: {summary['output_path']}")
+        if summary.get("fall_debug_timeline_path"):
+            self._append_log(f"Fall debug timeline: {summary['fall_debug_timeline_path']}")
         self._append_log(
             f"FPS={summary.get('fps', 0):.1f} | "
             f"Unique Track IDs={summary.get('unique_track_ids', 0)} | "
@@ -1539,7 +1788,9 @@ class MainWindow(QMainWindow):
             <b>Effective Action Pred Stride:</b> {summary.get('effective_action_pred_stride', 0) or 0}<br>
             <b>Effective Action Update Stride:</b> {summary.get('effective_action_update_stride', 0)}<br>
             <b>Effective MaxDet:</b> {summary.get('effective_max_det', 0)}<br>
+            <b>Scene Cut Resets:</b> {summary.get('scene_cut_resets', 0)}<br>
             <b>Action Queue Busy Frames:</b> {summary.get('action_queue_busy_frames', 0)}<br>
+            <b>Action Busy Skipped:</b> {summary.get('action_skipped_busy_count', 0)}<br>
             <b>Action Requests:</b> {summary.get('action_request_count', 0)}<br>
             <b>Action Completed:</b> {summary.get('action_completed_count', 0)}<br>
             <b>Action Stale Results Dropped:</b> {summary.get('action_stale_result_count', 0)}<br>
@@ -1551,7 +1802,8 @@ class MainWindow(QMainWindow):
             <b>Pose Weights:</b> {summary.get('pose_weights') or 'unknown'}<br>
             <b>Action Backend:</b> {summary.get('action_backend') or 'disabled'}<br>
             <b>Action Fast Mode:</b> {summary.get('action_fast_mode', False)}<br>
-            <b>Output:</b> {summary.get('output_path') or 'No file saved'}</p>
+            <b>Output:</b> {summary.get('output_path') or 'No file saved'}<br>
+            <b>Fall Debug Timeline:</b> {summary.get('fall_debug_timeline_path') or 'No debug timeline saved'}</p>
             <h4>Action Counts</h4>
             {action_html}
             """
