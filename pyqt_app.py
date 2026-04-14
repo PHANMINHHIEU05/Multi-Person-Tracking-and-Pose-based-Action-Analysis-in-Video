@@ -789,10 +789,11 @@ class InferenceWorker(QThread):
                     # Track-jump scene-cut fallback with debounce:
                     # trigger only when overlap collapses for consecutive processed frames.
                     track_jump_candidate = False
+                    single_subject_hard_jump = False
                     if (
                         not scene_cut_detected
                         and stable_last_bbox
-                        and len(track_ids) >= 4
+                        and len(track_ids) >= 1
                         and (frame_idx - last_scene_cut_frame) >= scene_cut_min_gap
                     ):
                         recent_prev_bboxes = [
@@ -801,7 +802,7 @@ class InferenceWorker(QThread):
                             if (frame_idx - stable_last_seen.get(candidate_sid, -10_000))
                             <= max(4, int(round(effective_process_stride + 2)))
                         ]
-                        if len(recent_prev_bboxes) >= 4:
+                        if len(track_ids) >= 4 and len(recent_prev_bboxes) >= 4:
                             low_overlap = 0
                             far_shift = 0
                             for curr_bbox in bboxes:
@@ -825,9 +826,42 @@ class InferenceWorker(QThread):
                                 and far_shift_ratio >= 0.82
                                 and scene_cut_change_ratio >= (scene_cut_pixel_change_ratio * 0.60)
                             )
+                        elif len(track_ids) <= 2 and len(recent_prev_bboxes) >= 1:
+                            severe_jump = 0
+                            for curr_bbox in bboxes:
+                                best_iou = 0.0
+                                best_dist = 10.0
+                                best_area_ratio = 1.0
+                                for prev_bbox in recent_prev_bboxes:
+                                    iou_val = bbox_iou_xyxy(curr_bbox, prev_bbox)
+                                    dist_val = bbox_center_distance_norm(curr_bbox, prev_bbox)
+                                    if iou_val > best_iou:
+                                        best_iou = iou_val
+                                        prev_w = max(float(prev_bbox[2] - prev_bbox[0]), 1e-3)
+                                        prev_h = max(float(prev_bbox[3] - prev_bbox[1]), 1e-3)
+                                        curr_w = max(float(curr_bbox[2] - curr_bbox[0]), 1e-3)
+                                        curr_h = max(float(curr_bbox[3] - curr_bbox[1]), 1e-3)
+                                        best_area_ratio = (curr_w * curr_h) / max(prev_w * prev_h, 1e-3)
+                                    if dist_val < best_dist:
+                                        best_dist = dist_val
+                                abrupt_cut = (
+                                    best_iou < 0.05
+                                    and best_dist > 0.62
+                                    and (
+                                        best_area_ratio < 0.58
+                                        or best_area_ratio > 1.82
+                                        or scene_cut_change_ratio >= (scene_cut_pixel_change_ratio * 0.50)
+                                    )
+                                )
+                                if abrupt_cut:
+                                    severe_jump += 1
+                            single_subject_hard_jump = severe_jump >= max(1, len(bboxes))
+                            if single_subject_hard_jump:
+                                track_jump_candidate = True
 
                     if track_jump_candidate:
-                        track_jump_vote_count = min(track_jump_vote_count + 1, 3)
+                        vote_inc = 2 if single_subject_hard_jump else 1
+                        track_jump_vote_count = min(track_jump_vote_count + vote_inc, 3)
                     else:
                         track_jump_vote_count = max(track_jump_vote_count - 1, 0)
 
@@ -963,7 +997,11 @@ class InferenceWorker(QThread):
                                 "tid": int(display_tid),
                                 "label": str(timeline_label),
                                 "conf": float(conf_val),
-                                "fall_cue": bool(debug_state.get("strong_fall_cue", False)),
+                                "fall_cue": bool(
+                                    debug_state.get("strong_fall_cue", False)
+                                    or debug_state.get("moderate_fall_cue", False)
+                                    or debug_state.get("lateral_fall_cue", False)
+                                ),
                                 "fall_vel": bool(debug_state.get("fall_velocity", False)),
                                 "fall_hold": int(debug_state.get("pending_fall_frames", 0)),
                                 "fall_recovery_votes": int(debug_state.get("fall_recovery_votes", 0)),

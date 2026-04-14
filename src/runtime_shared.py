@@ -691,6 +691,7 @@ class ActionRecognizerLite:
             "fall_velocity": False,
             "strong_fall_cue": False,
             "moderate_fall_cue": False,
+            "lateral_fall_cue": False,
             "chair_roll_cue": False,
             "height_ratio": 1.0,
             "area_ratio": 1.0,
@@ -744,26 +745,47 @@ class ActionRecognizerLite:
             quality["height_ratio"] = float(bbox_h / prev_h)
             quality["area_ratio"] = float((bbox_w * bbox_h) / prev_area)
 
-        quality["fall_velocity"] = bool(quality["downward_velocity"] > self.fall_velocity_ratio)
-        fall_trajectory = bool(quality["downward_velocity"] > self.fall_velocity_ratio * 0.88)
-        collapse_shape = bool(
-            quality["area_ratio"] < 0.78
-            or quality["bbox_aspect_ratio"] > 1.18
-            or (quality["height_ratio"] < 0.90 and quality["area_ratio"] < 0.88)
+        down_vel = float(quality["downward_velocity"])
+        center_motion = float(quality["center_motion_ratio"])
+        bbox_aspect = float(quality["bbox_aspect_ratio"])
+        area_ratio = float(quality["area_ratio"])
+        height_ratio = float(quality["height_ratio"])
+        quality["fall_velocity"] = bool(down_vel > self.fall_velocity_ratio)
+        fall_trajectory = bool(down_vel > self.fall_velocity_ratio * 0.88)
+        lateral_shift_signal = bool(
+            center_motion > max(self.upright_idle_center_motion_ratio * 2.2, 0.11)
+            and down_vel > (-self.fall_velocity_ratio * 0.35)
         )
-        quality["strong_fall_cue"] = bool(fall_trajectory and collapse_shape)
+        lateral_posture_break = bool(
+            bbox_aspect > 1.03
+            or area_ratio < 0.93
+            or height_ratio < 0.97
+        )
+        quality["lateral_fall_cue"] = bool(lateral_shift_signal and lateral_posture_break)
+        collapse_shape = bool(
+            area_ratio < 0.78
+            or bbox_aspect > 1.18
+            or (height_ratio < 0.90 and area_ratio < 0.88)
+        )
+        quality["strong_fall_cue"] = bool(collapse_shape and (fall_trajectory or quality["lateral_fall_cue"]))
         quality["moderate_fall_cue"] = bool(
-            quality["downward_velocity"] > self.fall_velocity_ratio * 0.55
-            and (
-                quality["bbox_aspect_ratio"] > 0.92
-                or quality["height_ratio"] < 0.96
-                or quality["area_ratio"] < 0.92
+            (
+                down_vel > self.fall_velocity_ratio * 0.48
+                and (
+                    bbox_aspect > 0.90
+                    or height_ratio < 0.97
+                    or area_ratio < 0.93
+                )
+            )
+            or (
+                quality["lateral_fall_cue"]
+                and (bbox_aspect > 1.00 or area_ratio < 0.98)
             )
         )
         quality["chair_roll_cue"] = bool(
-            quality["bbox_aspect_ratio"] > 1.00
-            and quality["height_ratio"] < 0.95
-            and quality["area_ratio"] < 0.96
+            bbox_aspect > 1.00
+            and height_ratio < 0.95
+            and area_ratio < 0.96
         )
         quality["looks_sit_transition"] = bool(
             quality["height_ratio"] < self.sitting_height_ratio or quality["area_ratio"] < self.sitting_area_ratio
@@ -1841,6 +1863,7 @@ class ActionRecognizerLite:
             "fall_velocity": bool(quality.get("fall_velocity", False)),
             "strong_fall_cue": bool(quality.get("strong_fall_cue", False)),
             "moderate_fall_cue": bool(quality.get("moderate_fall_cue", False)),
+            "lateral_fall_cue": bool(quality.get("lateral_fall_cue", False)),
             "chair_roll_cue": bool(quality.get("chair_roll_cue", False)),
             "bbox_aspect_ratio": float(quality.get("bbox_aspect_ratio", 1.0)),
             "occluded": bool(quality.get("occluded", False)),
