@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Dict, List
 
 from pyqt_app import InferenceWorker, RuntimeConfig
-from src.runtime_shared import resolve_default_action_model_path, resolve_default_pose_weights_path
+from src.runtime_shared import resolve_default_action_model_path
 
 
 def parse_args() -> argparse.Namespace:
@@ -30,11 +30,14 @@ def parse_args() -> argparse.Namespace:
 
 
 def _base_config(video_path: str) -> RuntimeConfig:
+    # Force PyTorch pose weights for stable cross-profile benchmarking in environments
+    # where TensorRT bindings may exist but CUDA runtime is unavailable.
+    pose_pt = str((Path(__file__).resolve().parent / "yolov8n-pose.pt").resolve())
     return RuntimeConfig(
         source_mode="video",
         video_path=video_path,
         camera_index=0,
-        pose_weights=resolve_default_pose_weights_path(),
+        pose_weights=pose_pt,
         action_model_path=resolve_default_action_model_path(),
         tracker_name="BoT-SORT (custom)",
         det_conf=0.25,
@@ -138,7 +141,7 @@ def apply_profile(cfg: RuntimeConfig, profile_name: str) -> RuntimeConfig:
     cfg.output_scale = 1.0
     cfg.normalize_timing = False
     cfg.target_analysis_fps = 12.0
-    cfg.pred_stride = 1
+    cfg.pred_stride = 2
     cfg.min_track_frames = 8
     cfg.action_conf = 0.30
     cfg.smooth_window = 2
@@ -206,4 +209,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

@@ -360,6 +360,7 @@ class ActionRecognizerLite:
         self._fall_candidate_votes: Dict[int, int] = {}
         self._fall_recovery_votes: Dict[int, int] = {}
         self._last_predict_ms: Dict[int, float] = {}
+        self._timeline_calibrator_state: Dict[int, Dict[str, object]] = {}
         self._overload_track_count = False
         self._over_budget_predict = False
 
@@ -483,6 +484,75 @@ class ActionRecognizerLite:
         fall_vel = bool(quality.get("fall_velocity", False))
         down_vel = float(quality.get("downward_velocity", 0.0))
         bbox_ar = float(quality.get("bbox_aspect_ratio", 1.0))
+        frame_count = int(self._frame_count.get(track_id, 0))
+        fall_event = float(fall_cue or fall_vel)
+
+        state = self._timeline_calibrator_state.get(track_id)
+        if state is None:
+            conf_hist = deque([float(confidence)], maxlen=5)
+            down_hist = deque([float(down_vel)], maxlen=5)
+            bbox_hist = deque([float(bbox_ar)], maxlen=5)
+            event_hist = deque([float(fall_event)], maxlen=5)
+            prev_conf = float(confidence)
+            prev_down_vel = float(down_vel)
+            prev_bbox_ar = float(bbox_ar)
+            prev_frame_count = frame_count
+            frame_gap = 1.0
+            is_new_track = 1.0
+        else:
+            conf_hist = state.get("conf_hist")
+            down_hist = state.get("down_hist")
+            bbox_hist = state.get("bbox_hist")
+            event_hist = state.get("event_hist")
+            if not isinstance(conf_hist, deque):
+                conf_hist = deque(maxlen=5)
+            if not isinstance(down_hist, deque):
+                down_hist = deque(maxlen=5)
+            if not isinstance(bbox_hist, deque):
+                bbox_hist = deque(maxlen=5)
+            if not isinstance(event_hist, deque):
+                event_hist = deque(maxlen=5)
+
+            prev_conf = float(state.get("prev_conf", confidence))
+            prev_down_vel = float(state.get("prev_down_vel", down_vel))
+            prev_bbox_ar = float(state.get("prev_bbox_ar", bbox_ar))
+            prev_frame_count = int(state.get("prev_frame_count", frame_count - 1))
+            frame_gap = float(max(1, frame_count - prev_frame_count))
+            is_new_track = float(frame_gap > 2.0 or frame_count <= 2)
+
+            conf_hist.append(float(confidence))
+            down_hist.append(float(down_vel))
+            bbox_hist.append(float(bbox_ar))
+            event_hist.append(float(fall_event))
+
+        if len(conf_hist) == 0:
+            conf_hist.append(float(confidence))
+        if len(down_hist) == 0:
+            down_hist.append(float(down_vel))
+        if len(bbox_hist) == 0:
+            bbox_hist.append(float(bbox_ar))
+        if len(event_hist) == 0:
+            event_hist.append(float(fall_event))
+
+        down_roll3 = float(np.mean(list(down_hist)[-3:]))
+        down_roll5 = float(np.mean(list(down_hist)[-5:]))
+        bbox_roll3 = float(np.mean(list(bbox_hist)[-3:]))
+        bbox_roll5 = float(np.mean(list(bbox_hist)[-5:]))
+        conf_roll3 = float(np.mean(list(conf_hist)[-3:]))
+        conf_roll5 = float(np.mean(list(conf_hist)[-5:]))
+        event_roll3 = float(np.mean(list(event_hist)[-3:]))
+        event_roll5 = float(np.mean(list(event_hist)[-5:]))
+
+        self._timeline_calibrator_state[track_id] = {
+            "prev_conf": float(confidence),
+            "prev_down_vel": float(down_vel),
+            "prev_bbox_ar": float(bbox_ar),
+            "prev_frame_count": frame_count,
+            "conf_hist": conf_hist,
+            "down_hist": down_hist,
+            "bbox_hist": bbox_hist,
+            "event_hist": event_hist,
+        }
 
         feature_map: dict[str, float] = {
             "conf": float(confidence),
@@ -490,27 +560,27 @@ class ActionRecognizerLite:
             "fall_vel": float(fall_vel),
             "fall_hold": float(max(0, self._pending_fall_until.get(track_id, 0) - self._frame_count.get(track_id, 0))),
             "fall_recovery_votes": float(self._fall_recovery_votes.get(track_id, 0)),
-            "down_vel": down_vel,
+            "down_vel": float(down_vel),
             "bbox_ar": bbox_ar,
             "abs_down_vel": abs(down_vel),
-            "delta_down_vel": down_vel,
-            "delta_bbox_ar": 0.0,
-            "delta_conf": 0.0,
-            "abs_delta_down_vel": abs(down_vel),
+            "delta_down_vel": float(down_vel - prev_down_vel),
+            "delta_bbox_ar": float(bbox_ar - prev_bbox_ar),
+            "delta_conf": float(float(confidence) - prev_conf),
+            "abs_delta_down_vel": abs(float(down_vel - prev_down_vel)),
             "bbox_ar_inv": 1.0 / max(bbox_ar, 1e-4),
-            "fall_event": float(fall_cue or fall_vel),
-            "frame_gap": 1.0,
-            "is_new_track": float(self._frame_count.get(track_id, 0) <= 2),
-            "track_age": float(self._frame_count.get(track_id, 0)),
-            "track_age_log": float(np.log1p(max(self._frame_count.get(track_id, 0), 0))),
-            "down_vel_roll3": down_vel,
-            "down_vel_roll5": down_vel,
-            "bbox_ar_roll3": bbox_ar,
-            "bbox_ar_roll5": bbox_ar,
-            "conf_roll3": float(confidence),
-            "conf_roll5": float(confidence),
-            "fall_event_roll3": float(fall_cue or fall_vel),
-            "fall_event_roll5": float(fall_cue or fall_vel),
+            "fall_event": float(fall_event),
+            "frame_gap": float(frame_gap),
+            "is_new_track": float(is_new_track),
+            "track_age": float(frame_count),
+            "track_age_log": float(np.log1p(max(frame_count, 0))),
+            "down_vel_roll3": float(down_roll3),
+            "down_vel_roll5": float(down_roll5),
+            "bbox_ar_roll3": float(bbox_roll3),
+            "bbox_ar_roll5": float(bbox_roll5),
+            "conf_roll3": float(conf_roll3),
+            "conf_roll5": float(conf_roll5),
+            "fall_event_roll3": float(event_roll3),
+            "fall_event_roll5": float(event_roll5),
             "cur_is_fall": float(label_bucket == "Fall"),
             "cur_is_walking": float(label_bucket == "Walking"),
             "cur_is_standing": float(label_bucket == "Standing"),
@@ -788,8 +858,11 @@ class ActionRecognizerLite:
             or quality.get("moderate_fall_cue", False)
             or quality.get("chair_roll_cue", False)
             or (
-                float(quality.get("downward_velocity", 0.0)) > (self.fall_velocity_ratio * 0.55)
-                and float(quality.get("bbox_aspect_ratio", 1.0)) > 0.88
+                float(quality.get("downward_velocity", 0.0)) > (self.fall_velocity_ratio * 0.45)
+                and (
+                    float(quality.get("bbox_aspect_ratio", 1.0)) > 0.80
+                    or float(quality.get("area_ratio", 1.0)) < 0.96
+                )
             )
         )
         if fall_like_sit_transition:
@@ -1403,8 +1476,11 @@ class ActionRecognizerLite:
                 or quality.get("moderate_fall_cue", False)
                 or quality.get("chair_roll_cue", False)
                 or (
-                    float(quality.get("downward_velocity", 0.0)) > (self.fall_velocity_ratio * 0.55)
-                    and float(quality.get("bbox_aspect_ratio", 1.0)) > 0.88
+                    float(quality.get("downward_velocity", 0.0)) > (self.fall_velocity_ratio * 0.45)
+                    and (
+                        float(quality.get("bbox_aspect_ratio", 1.0)) > 0.80
+                        or float(quality.get("area_ratio", 1.0)) < 0.96
+                    )
                 )
             )
             if fall_like_sit_transition:
@@ -1802,6 +1878,7 @@ class ActionRecognizerLite:
         self._fall_candidate_votes.pop(track_id, None)
         self._fall_recovery_votes.pop(track_id, None)
         self._last_predict_ms.pop(track_id, None)
+        self._timeline_calibrator_state.pop(track_id, None)
 
     def reset_track(self, track_id: int) -> None:
         self._drop_track(track_id)

@@ -455,6 +455,7 @@ class InferenceWorker(QThread):
                 and not cpu_only
                 and int(cfg.process_stride) <= 1
                 and int(cfg.pred_stride) <= 1
+                and int(cfg.max_det) <= 8
                 and not bool(cfg.normalize_timing)
                 and not bool(cfg.auto_tune_cpu)
             )
@@ -1671,7 +1672,7 @@ class MainWindow(QMainWindow):
             self.save_output_checkbox.setChecked(True)
             self.normalize_timing_checkbox.setChecked(False)
             self.target_analysis_fps_spin.setValue(12.0)
-            self.pred_stride_spin.setValue(1)
+            self.pred_stride_spin.setValue(2)
             self.min_track_frames_spin.setValue(8)
             self.action_conf_spin.setValue(0.30)
             self.smooth_window_spin.setValue(2)
