@@ -411,6 +411,7 @@ class InferenceWorker(QThread):
         effective_process_stride = max(1, cfg.process_stride)
         effective_preview_stride = max(1, cfg.preview_stride)
         effective_max_det = max(1, cfg.max_det)
+        effective_det_conf = float(cfg.det_conf)
         effective_target_analysis_fps = max(0.0, cfg.target_analysis_fps)
         cpu_auto_tuned = False
         if cfg.source_mode == "video" and not cfg.skip_action_model and effective_max_det < 3:
@@ -435,6 +436,16 @@ class InferenceWorker(QThread):
                 effective_process_stride,
                 int(round(fps_src / effective_target_analysis_fps)),
             )
+        if (
+            cfg.source_mode == "video"
+            and not cpu_only
+            and effective_process_stride >= 3
+            and effective_det_conf < 0.36
+        ):
+            effective_det_conf = 0.36
+            self.status_ready.emit(
+                f"Detection confidence raised to {effective_det_conf:.2f} for high-stride video to suppress false person tracks."
+            )
 
         effective_action_update_stride = 1
         action_backend = None
@@ -447,15 +458,24 @@ class InferenceWorker(QThread):
                 action_fast_mode = bool(cfg.auto_tune_cpu and cpu_only and cfg.source_mode == "video")
                 recognizer.fast_mode = action_fast_mode
                 action_fast_mode_used = action_fast_mode
-            # Accuracy-first desktop quality profile (video + GPU): allow denser action cadence.
-            # This keeps the user-selected pred/update stride when explicitly configured for quality.
+            # Accuracy-first desktop video profile (video + GPU): allow densest action cadence.
+            # Keep this strict so only explicit high-accuracy profiles use update stride = 1.
             accuracy_first_video = bool(
                 action_backend == "extratrees"
                 and cfg.source_mode == "video"
                 and not cpu_only
                 and int(cfg.process_stride) <= 1
                 and int(cfg.pred_stride) <= 1
-                and int(cfg.max_det) <= 8
+                and int(cfg.max_det) <= 12
+                and not bool(cfg.normalize_timing)
+                and not bool(cfg.auto_tune_cpu)
+            )
+            dense_pred_video = bool(
+                action_backend == "extratrees"
+                and cfg.source_mode == "video"
+                and not cpu_only
+                and int(cfg.pred_stride) <= 1
+                and int(effective_process_stride) <= 2
                 and not bool(cfg.normalize_timing)
                 and not bool(cfg.auto_tune_cpu)
             )
@@ -475,7 +495,7 @@ class InferenceWorker(QThread):
                     cpu_auto_tuned = True
             if action_backend == "extratrees" and cfg.source_mode == "video" and not cpu_only:
                 # Keep ET cadence stable on GPU video to avoid async queue thrashing.
-                target_pred_stride = 1 if accuracy_first_video else 2
+                target_pred_stride = 1 if (accuracy_first_video or dense_pred_video or int(effective_process_stride) >= 3) else 2
                 if current_pred_stride < target_pred_stride:
                     recognizer.pred_stride = target_pred_stride
                     current_pred_stride = target_pred_stride
@@ -488,22 +508,49 @@ class InferenceWorker(QThread):
                     self.status_ready.emit(
                         f"Action pred stride lowered to {target_pred_stride} for faster fall transitions on video."
                     )
+                current_min_frames = int(getattr(recognizer, "min_track_frames", cfg.min_track_frames))
+                if int(effective_process_stride) >= 3:
+                    target_min_frames = 4
+                elif int(effective_process_stride) >= 2:
+                    target_min_frames = 5
+                else:
+                    target_min_frames = 6
+                if current_min_frames > target_min_frames:
+                    recognizer.min_track_frames = target_min_frames
+                    self.status_ready.emit(
+                        f"Action min-track-frames lowered to {target_min_frames} for earlier Walking/Standing updates."
+                    )
             effective_action_pred_stride = current_pred_stride
             if accuracy_first_video and effective_action_update_stride > 1:
                 effective_action_update_stride = 1
-                self.status_ready.emit("Action update stride set to 1 for accuracy-first video quality mode.")
+                self.status_ready.emit("Action update stride set to 1 for accuracy-first video mode.")
             if cfg.normalize_timing and fps_src > 0:
                 target_action_fps = 8.0 if action_backend == "torch" else 10.0
                 effective_action_update_stride = max(
                     effective_action_update_stride,
                     int(round(fps_src / target_action_fps)),
                 )
+            if action_backend == "extratrees" and cfg.source_mode == "video" and not cpu_only and int(effective_process_stride) >= 3:
+                # High process stride already drops temporal density; keep action refresh tighter.
+                if effective_action_update_stride > 2:
+                    effective_action_update_stride = 2
+                    self.status_ready.emit("Action update stride capped to 2 for high-stride GPU video responsiveness.")
             if cfg.auto_tune_cpu and cpu_only and cfg.source_mode == "video":
                 effective_action_update_stride = max(effective_action_update_stride, 3)
             if action_backend == "extratrees" and cfg.source_mode == "video" and not cpu_only:
                 # ET worker typically returns in ~30-60ms. Updating every frame on 24+ FPS
                 # floods the pipeline and causes stale drops; keep a safer cadence.
-                floor_stride = 1 if accuracy_first_video else (3 if effective_max_det >= 20 else 2)
+                if accuracy_first_video:
+                    floor_stride = 1 if int(effective_process_stride) <= 1 else 2
+                else:
+                    if fps_src >= 27.0 and int(effective_process_stride) >= 2:
+                        floor_stride = 2 if effective_max_det <= 12 else 3
+                    elif fps_src >= 20.0:
+                        floor_stride = 2
+                    else:
+                        floor_stride = 1
+                    if int(effective_process_stride) >= 3:
+                        floor_stride = min(floor_stride, 2)
                 if effective_action_update_stride < floor_stride:
                     effective_action_update_stride = floor_stride
                     self.status_ready.emit(
@@ -556,6 +603,17 @@ class InferenceWorker(QThread):
         latest_action_task_id = 0
         latest_action_submitted_at: Optional[float] = None
         latest_action_task_by_track: dict[int, int] = {}
+        dynamic_action_update_stride = max(1, int(effective_action_update_stride))
+        if (
+            action_backend == "extratrees"
+            and cfg.source_mode == "video"
+            and not cpu_only
+            and int(effective_process_stride) <= 2
+        ):
+            dynamic_action_update_stride = 1
+            self.status_ready.emit("Action update stride primed at 1 for upright label stability on GPU video.")
+        action_busy_streak = 0
+        action_relief_streak = 0
         detection_stats = {"frames_processed": 0, "frames_with_detections": 0, "total_detections": 0}
         reader: Optional[VideoFrameReader] = None
         if cfg.source_mode == "video":
@@ -718,8 +776,8 @@ class InferenceWorker(QThread):
             visible_ids: set[int] = set()
             recognizer_active_ids: set[int] = set()
             should_process_frame = frame_idx % effective_process_stride == 0
-            action_update_due = frame_idx % max(1, effective_action_update_stride) == 0
-            preview_emit_due = cfg.live_preview
+            action_update_due = frame_idx % max(1, dynamic_action_update_stride) == 0
+            preview_emit_due = cfg.live_preview and (frame_idx % max(1, effective_preview_stride) == 0)
             should_draw_this_frame = (writer is not None) or preview_emit_due
 
             if should_process_frame:
@@ -770,7 +828,7 @@ class InferenceWorker(QThread):
                     frame,
                     persist=True,
                     tracker=tracker_cfg,
-                    conf=cfg.det_conf,
+                    conf=effective_det_conf,
                     iou=cfg.det_iou,
                     imgsz=effective_pose_imgsz,
                     max_det=effective_max_det,
@@ -911,9 +969,16 @@ class InferenceWorker(QThread):
                             dist = bbox_center_distance_norm(bbox, prev_display_bbox)
                             _, _, prev_label_name = recognizer.get_last_prediction(display_tid)
                             carryover_sensitive = prev_label_name in {"Fall", "Lying_Down"}
-                            hard_cut_jump = iou < 0.05 and (dist > 0.55 or area_ratio < 0.55 or area_ratio > 1.90)
+                            carryover_hard_jump = iou < 0.05 and (dist > 0.55 or area_ratio < 0.55 or area_ratio > 1.90)
+                            generic_hard_jump = iou < 0.03 and dist > 0.72 and (area_ratio < 0.50 or area_ratio > 2.20)
+                            scene_context_jump = scene_cut_change_ratio >= (scene_cut_pixel_change_ratio * 0.45)
                             extreme_jump = dist > 0.95
-                            if hard_cut_jump or (carryover_sensitive and extreme_jump):
+                            reset_on_jump = (
+                                (carryover_hard_jump or extreme_jump)
+                                if carryover_sensitive
+                                else (generic_hard_jump and scene_context_jump)
+                            )
+                            if reset_on_jump:
                                 recognizer.reset_track(display_tid)
                                 latest_action_task_by_track.pop(display_tid, None)
                                 visual_state_by_id.pop(display_tid, None)
@@ -960,6 +1025,16 @@ class InferenceWorker(QThread):
                                     # Backpressure: keep latest in-flight batch, don't flood the queue.
                                     action_busy_frames += 1
                                     action_skipped_busy_count += 1
+                                    action_busy_streak += 1
+                                    action_relief_streak = 0
+                                    if (
+                                        action_backend == "extratrees"
+                                        and cfg.source_mode == "video"
+                                        and not cpu_only
+                                        and action_busy_streak >= 2
+                                        and dynamic_action_update_stride < 4
+                                    ):
+                                        dynamic_action_update_stride += 1
                                 else:
                                     submitted_task_id = action_predictor.submit(ready_ids, feature_matrix)
                                     if submitted_task_id:
@@ -969,8 +1044,18 @@ class InferenceWorker(QThread):
                                         latest_action_submitted_at = time.perf_counter()
                                         for track_id in ready_ids:
                                             latest_action_task_by_track[track_id] = submitted_task_id
-                        else:
-                            batch_predictions = recognizer.predict_batch(pending_prediction_ids)
+                                        action_busy_streak = 0
+                                        action_relief_streak += 1
+                                        if (
+                                            dynamic_action_update_stride > effective_action_update_stride
+                                            and action_relief_streak >= 8
+                                        ):
+                                            dynamic_action_update_stride -= 1
+                                            action_relief_streak = 0
+                            else:
+                                action_relief_streak += 1
+                                action_busy_streak = 0
+                                batch_predictions = recognizer.predict_batch(pending_prediction_ids)
 
                     for entry in track_entries:
                         display_tid = int(entry["display_tid"])
@@ -1100,7 +1185,8 @@ class InferenceWorker(QThread):
 
             if cfg.live_preview and preview_emit_due:
                 now = time.time()
-                fps_ema = 0.92 * fps_ema + 0.08 * (1.0 / max(now - t_prev, 1e-6))
+                inst_fps = min(240.0, 1.0 / max(now - t_prev, 1e-4))
+                fps_ema = 0.92 * fps_ema + 0.08 * inst_fps
                 t_prev = now
                 qt_img = frame_to_qimage(frame, target_size=(cfg.preview_width, cfg.preview_height))
                 should_emit_preview = False
@@ -1113,7 +1199,8 @@ class InferenceWorker(QThread):
                     self.frame_ready.emit()
             elif should_process_frame:
                 now = time.time()
-                fps_ema = 0.92 * fps_ema + 0.08 * (1.0 / max(now - t_prev, 1e-6))
+                inst_fps = min(240.0, 1.0 / max(now - t_prev, 1e-4))
+                fps_ema = 0.92 * fps_ema + 0.08 * inst_fps
                 t_prev = now
 
             if frame_idx % max(1, effective_preview_stride) == 0:
@@ -1169,10 +1256,12 @@ class InferenceWorker(QThread):
                         "unique_track_ids": len(unique_stable_ids),
                         "falls": action_counts.get("Fall", 0),
                         "source_fps": fps_src,
+                        "effective_det_conf": effective_det_conf,
                         "effective_pose_imgsz": effective_pose_imgsz,
                         "effective_process_stride": effective_process_stride,
                         "effective_preview_stride": effective_preview_stride,
                         "effective_action_update_stride": effective_action_update_stride,
+                        "dynamic_action_update_stride": dynamic_action_update_stride,
                         "effective_action_pred_stride": effective_action_pred_stride or 0,
                         "effective_max_det": effective_max_det,
                         "scene_cut_resets": scene_cut_reset_count,
@@ -1232,6 +1321,7 @@ class InferenceWorker(QThread):
             "fps_live_ema": fps_ema,
             "elapsed_sec": elapsed,
             "source_fps": fps_src,
+            "effective_det_conf": effective_det_conf,
             "effective_pose_imgsz": effective_pose_imgsz,
             "effective_preview_stride": effective_preview_stride,
             "effective_max_det": effective_max_det,
@@ -1239,6 +1329,7 @@ class InferenceWorker(QThread):
             "effective_action_pred_stride": effective_action_pred_stride,
             "effective_process_stride": effective_process_stride,
             "effective_action_update_stride": effective_action_update_stride,
+            "dynamic_action_update_stride": dynamic_action_update_stride,
             "effective_target_analysis_fps": effective_target_analysis_fps,
             "pose_backend": pose_runtime.get("backend"),
             "pose_device": pose_runtime.get("device"),
@@ -1328,7 +1419,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("PyQt6 Fall Detection & Action Recognition")
         self.resize(1560, 920)
         self._build_ui()
-        self._apply_profile("quality")
+        self._apply_profile("balanced")
         self._sync_source_mode()
         self._sync_normalize_timing()
 
@@ -1534,6 +1625,7 @@ class MainWindow(QMainWindow):
             ("effective_max_det", "Effective MaxDet"),
             ("effective_action_pred_stride", "Action Pred Stride"),
             ("effective_action_update_stride", "Action Update Stride"),
+            ("dynamic_action_update_stride", "Action Update Dyn"),
             ("scene_cut_resets", "Scene Cut Resets"),
             ("action_queue_busy", "Action Busy"),
             ("action_inflight_ms", "Action Lag ms"),
@@ -1647,45 +1739,45 @@ class MainWindow(QMainWindow):
             self.imgsz_combo.setCurrentText("640")
             self.max_det_spin.setValue(12)
             self.live_preview_checkbox.setChecked(True)
-            self.process_stride_spin.setValue(1)
-            self.preview_stride_spin.setValue(4)
+            self.process_stride_spin.setValue(2)
+            self.preview_stride_spin.setValue(3)
             self.output_scale_combo.setCurrentText("1.0")
             self.save_output_checkbox.setChecked(False)
-            self.normalize_timing_checkbox.setChecked(True)
+            self.normalize_timing_checkbox.setChecked(False)
             self.target_analysis_fps_spin.setValue(12.0)
-            self.pred_stride_spin.setValue(3)
-            self.min_track_frames_spin.setValue(9)
+            self.pred_stride_spin.setValue(2)
+            self.min_track_frames_spin.setValue(5)
             self.action_conf_spin.setValue(0.30)
             self.smooth_window_spin.setValue(3)
             self.fall_conf_boost_spin.setValue(0.08)
-            self.sitting_conf_penalty_spin.setValue(0.20)
+            self.sitting_conf_penalty_spin.setValue(0.16)
             self.keypoint_integrity_spin.setValue(0.70)
             self.keypoint_jitter_spin.setValue(0.15)
             self.fall_priority_prob_spin.setValue(0.44)
             self.fall_velocity_ratio_spin.setValue(0.12)
             self.sitting_hold_frames_spin.setValue(5)
-            self.track_time_budget_spin.setValue(10.0)
-            self.fast_track_threshold_spin.setValue(5)
-            self.auto_tune_cpu_checkbox.setChecked(True)
+            self.track_time_budget_spin.setValue(9.0)
+            self.fast_track_threshold_spin.setValue(6)
+            self.auto_tune_cpu_checkbox.setChecked(False)
         elif profile_name == "fast":
             self.tracker_combo.setCurrentText("ByteTrack (custom)")
-            self.det_conf_spin.setValue(0.28)
+            self.det_conf_spin.setValue(0.30)
             self.det_iou_spin.setValue(0.45)
             self.imgsz_combo.setCurrentText("480")
-            self.max_det_spin.setValue(20)
+            self.max_det_spin.setValue(12)
             self.live_preview_checkbox.setChecked(True)
             self.process_stride_spin.setValue(2)
             self.preview_stride_spin.setValue(5)
             self.output_scale_combo.setCurrentText("0.75")
             self.save_output_checkbox.setChecked(False)
-            self.normalize_timing_checkbox.setChecked(True)
-            self.target_analysis_fps_spin.setValue(10.0)
-            self.pred_stride_spin.setValue(4)
-            self.min_track_frames_spin.setValue(8)
+            self.normalize_timing_checkbox.setChecked(False)
+            self.target_analysis_fps_spin.setValue(12.0)
+            self.pred_stride_spin.setValue(1)
+            self.min_track_frames_spin.setValue(5)
             self.action_conf_spin.setValue(0.31)
             self.smooth_window_spin.setValue(3)
             self.fall_conf_boost_spin.setValue(0.08)
-            self.sitting_conf_penalty_spin.setValue(0.20)
+            self.sitting_conf_penalty_spin.setValue(0.16)
             self.keypoint_integrity_spin.setValue(0.68)
             self.keypoint_jitter_spin.setValue(0.18)
             self.fall_priority_prob_spin.setValue(0.42)
@@ -1693,7 +1785,7 @@ class MainWindow(QMainWindow):
             self.sitting_hold_frames_spin.setValue(4)
             self.track_time_budget_spin.setValue(8.0)
             self.fast_track_threshold_spin.setValue(5)
-            self.auto_tune_cpu_checkbox.setChecked(True)
+            self.auto_tune_cpu_checkbox.setChecked(False)
         else:
             self.tracker_combo.setCurrentText("BoT-SORT (custom)")
             pose_pt = ROOT / "yolov8n-pose.pt"
@@ -1715,7 +1807,7 @@ class MainWindow(QMainWindow):
             self.action_conf_spin.setValue(0.30)
             self.smooth_window_spin.setValue(2)
             self.fall_conf_boost_spin.setValue(0.10)
-            self.sitting_conf_penalty_spin.setValue(0.22)
+            self.sitting_conf_penalty_spin.setValue(0.16)
             self.keypoint_integrity_spin.setValue(0.68)
             self.keypoint_jitter_spin.setValue(0.18)
             self.fall_priority_prob_spin.setValue(0.46)
@@ -1821,11 +1913,13 @@ class MainWindow(QMainWindow):
             <b>Total Detections:</b> {summary.get('total_detections', 0)}<br>
             <b>Frames With Detections:</b> {summary.get('frames_with_detections', 0)}<br>
             <b>Source FPS:</b> {summary.get('source_fps', 0):.1f}<br>
+            <b>Effective Det Conf:</b> {summary.get('effective_det_conf', 0):.2f}<br>
             <b>Effective Pose ImgSz:</b> {summary.get('effective_pose_imgsz', 0)}<br>
             <b>Effective Process Stride:</b> {summary.get('effective_process_stride', 0)}<br>
             <b>Effective Preview Stride:</b> {summary.get('effective_preview_stride', 0)}<br>
             <b>Effective Action Pred Stride:</b> {summary.get('effective_action_pred_stride', 0) or 0}<br>
             <b>Effective Action Update Stride:</b> {summary.get('effective_action_update_stride', 0)}<br>
+            <b>Dynamic Action Update Stride:</b> {summary.get('dynamic_action_update_stride', summary.get('effective_action_update_stride', 0))}<br>
             <b>Effective MaxDet:</b> {summary.get('effective_max_det', 0)}<br>
             <b>Scene Cut Resets:</b> {summary.get('scene_cut_resets', 0)}<br>
             <b>Action Queue Busy Frames:</b> {summary.get('action_queue_busy_frames', 0)}<br>
@@ -1840,7 +1934,7 @@ class MainWindow(QMainWindow):
             <b>Pose Device:</b> {summary.get('pose_device') or 'unknown'}<br>
             <b>Pose Weights:</b> {summary.get('pose_weights') or 'unknown'}<br>
             <b>Action Backend:</b> {summary.get('action_backend') or 'disabled'}<br>
-            <b>Action Fast Mode:</b> {summary.get('action_fast_mode', False)}<br>
+            <b>Action Fast Seq Mode (CPU):</b> {summary.get('action_fast_mode', False)}<br>
             <b>Output:</b> {summary.get('output_path') or 'No file saved'}<br>
             <b>Fall Debug Timeline:</b> {summary.get('fall_debug_timeline_path') or 'No debug timeline saved'}</p>
             <h4>Action Counts</h4>

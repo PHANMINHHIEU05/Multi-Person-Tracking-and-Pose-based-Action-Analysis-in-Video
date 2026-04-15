@@ -62,7 +62,7 @@ def _base_config(video_path: str) -> RuntimeConfig:
         action_conf=0.30,
         smooth_window=2,
         fall_conf_boost=0.10,
-        sitting_conf_penalty=0.22,
+        sitting_conf_penalty=0.16,
         keypoint_integrity_ratio=0.68,
         keypoint_jitter_ratio=0.18,
         fall_priority_prob=0.46,
@@ -81,44 +81,44 @@ def apply_profile(cfg: RuntimeConfig, profile_name: str) -> RuntimeConfig:
         cfg.det_iou = 0.50
         cfg.imgsz = 640
         cfg.max_det = 12
-        cfg.process_stride = 1
-        cfg.preview_stride = 4
+        cfg.process_stride = 2
+        cfg.preview_stride = 3
         cfg.output_scale = 1.0
-        cfg.normalize_timing = True
+        cfg.normalize_timing = False
         cfg.target_analysis_fps = 12.0
-        cfg.pred_stride = 3
-        cfg.min_track_frames = 9
+        cfg.pred_stride = 2
+        cfg.min_track_frames = 5
         cfg.action_conf = 0.30
         cfg.smooth_window = 3
         cfg.fall_conf_boost = 0.08
-        cfg.sitting_conf_penalty = 0.20
+        cfg.sitting_conf_penalty = 0.16
         cfg.keypoint_integrity_ratio = 0.70
         cfg.keypoint_jitter_ratio = 0.15
         cfg.fall_priority_prob = 0.44
         cfg.fall_velocity_ratio = 0.12
         cfg.sitting_hold_frames = 5
-        cfg.track_time_budget_ms = 10.0
-        cfg.fast_track_threshold = 5
-        cfg.auto_tune_cpu = True
+        cfg.track_time_budget_ms = 9.0
+        cfg.fast_track_threshold = 6
+        cfg.auto_tune_cpu = False
         return cfg
 
     if profile == "fast":
         cfg.tracker_name = "ByteTrack (custom)"
-        cfg.det_conf = 0.28
+        cfg.det_conf = 0.30
         cfg.det_iou = 0.45
         cfg.imgsz = 480
-        cfg.max_det = 20
+        cfg.max_det = 12
         cfg.process_stride = 2
         cfg.preview_stride = 5
         cfg.output_scale = 0.75
-        cfg.normalize_timing = True
-        cfg.target_analysis_fps = 10.0
-        cfg.pred_stride = 4
-        cfg.min_track_frames = 8
+        cfg.normalize_timing = False
+        cfg.target_analysis_fps = 12.0
+        cfg.pred_stride = 1
+        cfg.min_track_frames = 5
         cfg.action_conf = 0.31
         cfg.smooth_window = 3
         cfg.fall_conf_boost = 0.08
-        cfg.sitting_conf_penalty = 0.20
+        cfg.sitting_conf_penalty = 0.16
         cfg.keypoint_integrity_ratio = 0.68
         cfg.keypoint_jitter_ratio = 0.18
         cfg.fall_priority_prob = 0.42
@@ -126,7 +126,7 @@ def apply_profile(cfg: RuntimeConfig, profile_name: str) -> RuntimeConfig:
         cfg.sitting_hold_frames = 4
         cfg.track_time_budget_ms = 8.0
         cfg.fast_track_threshold = 5
-        cfg.auto_tune_cpu = True
+        cfg.auto_tune_cpu = False
         return cfg
 
     # quality default
@@ -146,7 +146,7 @@ def apply_profile(cfg: RuntimeConfig, profile_name: str) -> RuntimeConfig:
     cfg.action_conf = 0.30
     cfg.smooth_window = 2
     cfg.fall_conf_boost = 0.10
-    cfg.sitting_conf_penalty = 0.22
+    cfg.sitting_conf_penalty = 0.16
     cfg.keypoint_integrity_ratio = 0.68
     cfg.keypoint_jitter_ratio = 0.18
     cfg.fall_priority_prob = 0.46
