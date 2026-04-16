@@ -363,12 +363,15 @@ class ActionRecognizerLite:
         self._last_predict_ms: Dict[int, float] = {}
         self._timeline_calibrator_state: Dict[int, Dict[str, object]] = {}
         self._physics_vote_state: Dict[int, Dict[str, int]] = {}
+        self._upright_last_switch_frame: Dict[int, int] = {}
+        self._last_upright_label: Dict[int, int] = {}
+        self._upright_motion_votes: Dict[int, Dict[str, int]] = {}
         self._overload_track_count = False
         self._over_budget_predict = False
 
         self.min_keypoint_ratio = float(np.clip(min_keypoint_ratio, 0.10, 1.0))
         self.max_keypoint_jitter_ratio = float(max(max_keypoint_jitter_ratio, 0.01))
-        self.fall_priority_prob = float(np.clip(fall_priority_prob, 0.05, 0.99))
+        self.fall_priority_prob = float(np.clip(fall_priority_prob, 0.05, 0.99))  # FIX: recommended runtime value is 0.32; higher profile defaults can miss fast falls
         self.fall_velocity_ratio = float(max(fall_velocity_ratio, 0.01))
         self.sitting_hold_frames = max(1, int(sitting_hold_frames))
         self.sitting_height_ratio = float(np.clip(sitting_height_ratio, 0.30, 1.20))
@@ -382,8 +385,8 @@ class ActionRecognizerLite:
         self.fall_release_votes = 2
         self.fall_new_track_conf = 0.72
         self.fall_fastpath_conf = 0.45
-        self.fall_live_fastpath_conf = 0.47
-        self.fall_live_fastpath_velocity_ratio = self.fall_velocity_ratio * 0.92
+        self.fall_live_fastpath_conf = 0.50
+        self.fall_live_fastpath_velocity_ratio = self.fall_velocity_ratio * 1.08
         # Slightly stricter transition floor to suppress no-cue Fall flips on upright posture.
         self.fall_transition_conf_floor = 0.55
         self.fall_decay_bbox_aspect_floor = 1.22
@@ -395,10 +398,12 @@ class ActionRecognizerLite:
         self._occlusion_lower_body_ratio = 0.50
 
         self._label_id_by_name = {str(name): int(label_id) for label_id, name in self.label_map.items()}
+        self._walking_id: Optional[int] = next((k for k, v in self.label_map.items() if v == "Walking"), None)  # FIX: cache Walking ID for physics override
+        self._standing_id: Optional[int] = next((k for k, v in self.label_map.items() if v == "Standing"), None)  # FIX: cache Standing ID for physics override
         self._fall_label_id = self._label_id_by_name.get("Fall")
         self._lying_label_id = self._label_id_by_name.get("Lying_Down")
-        self._standing_label_id = self._label_id_by_name.get("Standing")
-        self._walking_label_id = self._label_id_by_name.get("Walking")
+        self._standing_label_id = self._standing_id  # FIX: reuse cached Standing ID
+        self._walking_label_id = self._walking_id  # FIX: reuse cached Walking ID
         self._sitting_label_ids = {
             label_id
             for label_name, label_id in self._label_id_by_name.items()
@@ -464,6 +469,11 @@ class ActionRecognizerLite:
             return
 
         self.timeline_calibrator_model = model
+        if hasattr(self.timeline_calibrator_model, "set_params") and hasattr(self.timeline_calibrator_model, "n_jobs"):
+            try:
+                self.timeline_calibrator_model.set_params(n_jobs=1)
+            except Exception:
+                pass
         self.timeline_calibrator_path = str(path)
         self.timeline_calibrator_feature_names = [str(name) for name in feature_names]
         self.timeline_calibrator_id_to_label = id_to_label
@@ -604,11 +614,35 @@ class ActionRecognizerLite:
     ) -> Tuple[int, float, bool, str]:
         if self.timeline_calibrator_model is None:
             return label_id, confidence, False, ""
+        # Keep priority classes untouched by calibrator: Fall/Lying/Sitting remain source-of-truth.
+        if label_id == self._fall_label_id or label_id == self._lying_label_id or label_id in self._sitting_label_ids:
+            return label_id, confidence, False, ""
+        # Calibrator is most useful on ambiguous windows; skip high-confidence stable outputs.
+        if confidence >= 0.80:
+            return label_id, confidence, False, ""
+        frame_count = self._frame_count.get(track_id, 0)
+        if frame_count < max(self.min_track_frames + 2, 10):
+            return label_id, confidence, False, ""
+
+        quality = self._quality_state.get(track_id, {})
+        if (
+            bool(quality.get("fall_velocity", False))
+            or bool(quality.get("strong_fall_cue", False))
+            or bool(quality.get("moderate_fall_cue", False))
+            or bool(quality.get("lateral_fall_cue", False))
+            or bool(quality.get("chair_roll_cue", False))
+            or bool(quality.get("looks_sit_transition", False))
+        ):
+            return label_id, confidence, False, ""
+
+        prev_label_id, prev_conf = self._last_pred.get(track_id, (-1, 0.0))
+        if prev_label_id == label_id and confidence >= max(prev_conf * 0.92, 0.58):
+            return label_id, confidence, False, ""
+
         feat = self._build_timeline_calibrator_features(track_id, label_id, confidence)
         if feat is None:
             return label_id, confidence, False, ""
 
-        quality = self._quality_state.get(track_id, {})
         strong_fall_signal = bool(
             quality.get("fall_velocity", False)
             or quality.get("strong_fall_cue", False)
@@ -1328,18 +1362,19 @@ class ActionRecognizerLite:
         occluded = bool(quality.get("occluded", False))
         looks_sit_transition = bool(quality.get("looks_sit_transition", False))
         prev_label_id, prev_conf = self._last_pred.get(track_id, (-1, 0.0))
+        frame_count = self._frame_count.get(track_id, 0)
 
         walk_motion_signal = bool(
-            center_motion_ratio >= max(self.upright_idle_center_motion_ratio * 0.86, 0.046)
+            center_motion_ratio >= max(self.upright_idle_center_motion_ratio * 0.55, 0.029)
             and bbox_aspect < 1.10
-            and abs(downward_velocity) < (self.fall_velocity_ratio * 0.55)
+            and abs(downward_velocity) < (self.fall_velocity_ratio * 0.60)
         )
 
         if label_id == self._standing_label_id:
             if (
                 confidence <= 0.38
                 and bbox_aspect < 0.36
-                and center_motion_ratio >= max(self.upright_idle_center_motion_ratio * 0.58, 0.032)
+                and center_motion_ratio >= max(self.upright_idle_center_motion_ratio * 0.36, 0.020)
                 and abs(downward_velocity) < (self.fall_velocity_ratio * 0.70)
             ):
                 walk_conf = max(prev_conf * 0.90, confidence * 0.86, 0.39)
@@ -1350,7 +1385,7 @@ class ActionRecognizerLite:
             if (
                 confidence < 0.54
                 and bbox_aspect < 0.26
-                and center_motion_ratio >= max(self.upright_idle_center_motion_ratio * 0.62, 0.034)
+                and center_motion_ratio >= max(self.upright_idle_center_motion_ratio * 0.44, 0.024)
                 and abs(downward_velocity) < (self.fall_velocity_ratio * 0.75)
             ):
                 walk_conf = max(prev_conf * 0.88, confidence * 0.82, 0.38)
@@ -1362,10 +1397,13 @@ class ActionRecognizerLite:
         if label_id == self._walking_label_id:
             standing_like_walk = bool(
                 self._standing_label_id is not None
-                and center_motion_ratio < max(self.upright_idle_center_motion_ratio * 0.50, 0.028)
+                and center_motion_ratio < max(self.upright_idle_center_motion_ratio * 0.18, 0.010)
                 and abs(downward_velocity) < (self.fall_velocity_ratio * 0.35)
-                and abs(area_ratio - 1.0) <= 0.10
-                and bbox_aspect < 0.92
+                and abs(area_ratio - 1.0) <= 0.08
+                and bbox_aspect < 0.75
+                and confidence <= max(prev_conf + 0.18, 0.78)
+                and prev_label_id == self._standing_label_id
+                and frame_count <= max(self.upright_start_frames + 4, 12)
                 and not looks_sit_transition
                 and not occluded
             )
@@ -1412,12 +1450,22 @@ class ActionRecognizerLite:
                 and bbox_aspect >= 0.38
             )
             vertical_sit_shape = bool(
-                bbox_aspect < 0.45
-                and confidence < 0.66
+                bbox_aspect < 0.42
+                and confidence < 0.60
                 and abs(downward_velocity) < (self.fall_velocity_ratio * 0.95)
             )
+            strong_sit_context = bool(
+                looks_sit_transition
+                and 0.42 <= bbox_aspect < 1.22
+                and lower_body_ratio >= 0.42
+                and center_motion_ratio < max(self.upright_idle_center_motion_ratio * 0.95, 0.045)
+                and abs(downward_velocity) < (self.fall_velocity_ratio * 0.75)
+            )
+            if strong_sit_context:
+                sit_conf = max(prev_conf * 0.78, confidence, 0.42)
+                return label_id, sit_conf, True, "walk_focus_keep_strong_sitting"
             severe_occluded_sit = bool(
-                ((occluded or lower_body_ratio < 0.52) and bbox_aspect < 0.50 and confidence < 0.62)
+                ((occluded or lower_body_ratio < 0.48) and bbox_aspect < 0.46 and confidence < 0.58)
                 or vertical_sit_shape
             )
             if severe_occluded_sit and not plausible_occluded_sit:
@@ -1430,10 +1478,10 @@ class ActionRecognizerLite:
                 return -1, 0.0, True, "walk_focus_occluded_sitting_unknown"
             ambiguous_sit = bool(
                 not looks_sit_transition
-                and confidence < 0.52
+                and confidence < 0.46
                 and abs(downward_velocity) < (self.fall_velocity_ratio * 0.85)
                 and bbox_aspect < 1.12
-                and (lower_body_ratio < 0.62 or walk_motion_signal)
+                and (lower_body_ratio < 0.56 or walk_motion_signal)
             )
             if ambiguous_sit:
                 if prev_label_id in {self._walking_label_id, self._standing_label_id}:
@@ -1474,6 +1522,18 @@ class ActionRecognizerLite:
         downward_velocity = float(quality.get("downward_velocity", 0.0))
         looks_sit_transition = bool(quality.get("looks_sit_transition", False))
         prev_label_id, prev_conf = self._last_pred.get(track_id, (-1, 0.0))
+        frame_count = self._frame_count.get(track_id, 0)
+
+        transition_supported_sit = bool(
+            looks_sit_transition
+            and 0.34 <= bbox_aspect < 1.22
+            and lower_body_ratio >= 0.40
+            and center_motion_ratio < max(self.upright_idle_center_motion_ratio * 0.95, 0.045)
+            and abs(downward_velocity) < (self.fall_velocity_ratio * 0.75)
+        )
+        if transition_supported_sit:
+            sit_conf = max(prev_conf * 0.72, confidence, 0.38)
+            return label_id, sit_conf, True, "sit_plausible_transition_keep"
 
         very_vertical_sit = bool(
             bbox_aspect < 0.36
@@ -1481,9 +1541,10 @@ class ActionRecognizerLite:
             and abs(downward_velocity) < (self.fall_velocity_ratio * 0.85)
         )
         hard_vertical_sit = bool(
-            bbox_aspect < 0.40
-            and lower_body_ratio < 0.62
+            bbox_aspect < 0.38
+            and lower_body_ratio < 0.58
             and abs(downward_velocity) < (self.fall_velocity_ratio * 0.95)
+            and (not looks_sit_transition or lower_body_ratio < 0.48)
         )
         # Very vertical box + weak sit-transition cues => Sitting is usually spurious.
         implausible_vertical_sit = bool(
@@ -1493,7 +1554,7 @@ class ActionRecognizerLite:
                 bbox_aspect < 0.48
                 and not looks_sit_transition
                 and abs(downward_velocity) < (self.fall_velocity_ratio * 0.70)
-                and lower_body_ratio < 0.62
+                and lower_body_ratio < 0.58
             )
         )
         if not implausible_vertical_sit:
@@ -1534,6 +1595,7 @@ class ActionRecognizerLite:
         chair_roll_cue = bool(quality.get("chair_roll_cue", False))
         fall_velocity = bool(quality.get("fall_velocity", False))
         prev_label_id, prev_conf = self._last_pred.get(track_id, (-1, 0.0))
+        frame_count = self._frame_count.get(track_id, 0)
 
         votes = self._physics_vote_state.setdefault(track_id, {"walk": 0, "stand": 0, "fall": 0})
         upright_force_context = bool(
@@ -1545,32 +1607,40 @@ class ActionRecognizerLite:
         # Strict upright overrides with short vote windows to avoid label flicker.
         if label_id in {self._standing_label_id, self._walking_label_id}:
             moving_fast = bool(
-                center_motion_ratio > max(self.upright_idle_center_motion_ratio * 0.78, 0.042)
-                and abs(downward_velocity) < (self.fall_velocity_ratio * 0.72)
+                center_motion_ratio > max(self.upright_idle_center_motion_ratio * 0.55, 0.029)
+                and abs(downward_velocity) < (self.fall_velocity_ratio * 0.70)
                 and bbox_aspect < 1.08
             )
             standing_like_idle = bool(
-                center_motion_ratio < max(self.upright_idle_center_motion_ratio * 0.62, 0.030)
-                and jitter_ratio < max(self.upright_idle_jitter_ratio * 1.20, 0.054)
-                and bbox_aspect < 1.02
-                and abs(downward_velocity) < (self.fall_velocity_ratio * 0.55)
+                center_motion_ratio < max(self.upright_idle_center_motion_ratio * 0.18, 0.010)
+                and jitter_ratio < max(self.upright_idle_jitter_ratio * 1.05, 0.048)
+                and abs(area_ratio - 1.0) <= 0.08
+                and bbox_aspect < 1.00
+                and abs(downward_velocity) < (self.fall_velocity_ratio * 0.50)
             )
 
             if label_id == self._standing_label_id and moving_fast and upright_force_context:
                 votes["walk"] = int(votes.get("walk", 0)) + 1
                 votes["stand"] = 0
-                strong_walk_motion = center_motion_ratio > max(self.upright_idle_center_motion_ratio * 0.98, 0.052)
-                walk_votes_needed = 1 if strong_walk_motion else 2
+                strong_walk_motion = center_motion_ratio > max(self.upright_idle_center_motion_ratio * 0.86, 0.046)
+                walk_votes_needed = 1 if (strong_walk_motion and prev_label_id == self._walking_label_id) else 2
                 if votes["walk"] >= walk_votes_needed and self._walking_label_id is not None:
-                    forced_conf = max(confidence, prev_conf * 0.90, 0.68)
+                    forced_conf = max(confidence, prev_conf * 0.90, 0.64)
                     return self._walking_label_id, forced_conf, True, "physics_force_walk_due_to_motion"
-            elif label_id == self._walking_label_id and standing_like_idle and upright_force_context:
+            elif (
+                label_id == self._walking_label_id
+                and standing_like_idle
+                and upright_force_context
+                and frame_count <= max(self.upright_start_frames + 8, 16)
+            ):
                 votes["stand"] = int(votes.get("stand", 0)) + 1
                 votes["walk"] = 0
-                very_idle = center_motion_ratio < max(self.upright_idle_center_motion_ratio * 0.45, 0.024)
-                stand_votes_needed = 1 if (very_idle and prev_label_id == self._standing_label_id) else 2
+                very_idle = center_motion_ratio < max(self.upright_idle_center_motion_ratio * 0.16, 0.009)
+                stand_votes_needed = 3 if prev_label_id == self._standing_label_id else 5
+                if not very_idle and confidence >= max(prev_conf + 0.04, 0.56):
+                    stand_votes_needed += 1
                 if votes["stand"] >= stand_votes_needed and self._standing_label_id is not None:
-                    forced_conf = max(confidence, prev_conf * 0.88, 0.66)
+                    forced_conf = max(confidence, prev_conf * 0.84, 0.50)
                     return self._standing_label_id, forced_conf, True, "physics_force_standing_due_idle"
             else:
                 votes["walk"] = 0
@@ -1872,7 +1942,7 @@ class ActionRecognizerLite:
             and bbox_aspect < 0.95
         )
 
-        predicted_fall_confident = bool(
+        predicted_fall_confident = bool(  # FIX: recommended runtime fall_priority_prob is 0.32; 0.42-0.46 can delay fall capture
             label_id == self._fall_label_id and confidence >= max(self.fall_priority_prob + 0.12, 0.55)
         )
         should_trigger_fall = bool(
@@ -1968,6 +2038,7 @@ class ActionRecognizerLite:
         moderate_fall_cue = bool(quality.get("moderate_fall_cue", False))
         lateral_fall_cue = bool(quality.get("lateral_fall_cue", False))
         chair_roll_cue = bool(quality.get("chair_roll_cue", False))
+        looks_sit_transition = bool(quality.get("looks_sit_transition", False))
         fall_velocity = bool(quality.get("fall_velocity", False))
         downward_velocity = float(quality.get("downward_velocity", 0.0))
         area_ratio = float(quality.get("area_ratio", 1.0))
@@ -1977,41 +2048,55 @@ class ActionRecognizerLite:
             return
         dynamic_fall_signal = bool(
             fall_velocity
-            or downward_velocity > (self.fall_live_fastpath_velocity_ratio * 0.72)
-            or center_motion_ratio > max(self.upright_idle_center_motion_ratio * 1.35, 0.09)
+            or downward_velocity > (self.fall_live_fastpath_velocity_ratio * 0.98)
+            or (
+                lateral_fall_cue
+                and center_motion_ratio > max(self.upright_idle_center_motion_ratio * 1.65, 0.11)
+                and (bbox_aspect > 1.02 or area_ratio < 0.92)
+            )
         )
         rapid_transition_cue = bool(
-            (chair_roll_cue and dynamic_fall_signal and area_ratio < 0.92)
+            (chair_roll_cue and dynamic_fall_signal and area_ratio < 0.88)
             or (
                 lateral_fall_cue
                 and dynamic_fall_signal
-                and center_motion_ratio > max(self.upright_idle_center_motion_ratio * 1.45, 0.09)
-                and (bbox_aspect >= 0.96 or area_ratio < 0.95)
+                and center_motion_ratio > max(self.upright_idle_center_motion_ratio * 1.70, 0.11)
+                and (bbox_aspect >= 1.02 or area_ratio < 0.90)
             )
             or (
                 moderate_fall_cue
-                and dynamic_fall_signal
-                and (bbox_aspect >= 0.98 or area_ratio < 0.92)
+                and fall_velocity
+                and (bbox_aspect >= 1.06 or area_ratio < 0.88)
             )
             or (
                 fall_velocity
-                and downward_velocity > self.fall_live_fastpath_velocity_ratio
-                and (bbox_aspect > 0.98 or area_ratio < 0.95)
+                and downward_velocity > (self.fall_live_fastpath_velocity_ratio * 1.06)
+                and (bbox_aspect > 1.04 or area_ratio < 0.90)
             )
         )
         if not (strong_fall_cue or rapid_transition_cue):
             return
-        if not dynamic_fall_signal and not strong_fall_cue:
+        if not dynamic_fall_signal and not (strong_fall_cue and fall_velocity):
             return
-        if bbox_aspect < 0.84 and area_ratio > 0.90 and not chair_roll_cue:
+        if bbox_aspect < 0.90 and area_ratio > 0.86 and not chair_roll_cue and not lateral_fall_cue:
             return
+        if looks_sit_transition and not strong_fall_cue and not lateral_fall_cue:
+            allow_sit_to_fall_fastpath = bool(
+                fall_velocity
+                and downward_velocity > (self.fall_live_fastpath_velocity_ratio * 1.20)
+                and area_ratio < 0.82
+            )
+            if not allow_sit_to_fall_fastpath:
+                return
 
         prev_label_id, prev_conf = self._last_pred.get(track_id, (-1, 0.0))
-        if prev_label_id < 0 and not (strong_fall_cue or fall_velocity):
+        if prev_label_id < 0 and not (strong_fall_cue and fall_velocity):
             return
         if prev_label_id == self._fall_label_id:
             return
         if prev_label_id == self._lying_label_id and not strong_fall_cue:
+            return
+        if prev_label_id == self._standing_label_id and not (strong_fall_cue and fall_velocity):
             return
         if (
             prev_label_id >= 0
@@ -2103,6 +2188,7 @@ class ActionRecognizerLite:
 
     def _apply_prediction_result(self, track_id: int, label_id: int, confidence: float) -> Tuple[int, float, str]:
         quality = self._quality_state.setdefault(track_id, {})
+        prev_output_label_id, prev_output_conf = self._last_pred.get(track_id, (-1, 0.0))
         quality["rescue_applied"] = False
         quality["rescue_reason"] = ""
         class_threshold = self.conf_threshold
@@ -2142,7 +2228,8 @@ class ActionRecognizerLite:
             )
             if fall_like_sit_transition:
                 sit_penalty = max(sit_penalty, self.sitting_conf_penalty + 0.06)
-            class_threshold = min(0.99, self.conf_threshold + sit_penalty)
+            sitting_effective_penalty = min(sit_penalty, 0.045)  # FIX: softer sitting threshold to keep sit recall without opening too many false positives
+            class_threshold = min(0.95, self.conf_threshold + sitting_effective_penalty)  # FIX: apply softer threshold ceiling for Sitting classes
 
         fall_label_id, fall_conf, fall_applied, fall_reason = self._apply_fall_priority_rule(
             track_id, label_id, confidence
@@ -2365,6 +2452,134 @@ class ActionRecognizerLite:
             quality["rescue_reason"] = physics_reason
             self._last_pred[track_id] = (int(physics_label_id), float(physics_conf))
             lid, conf = self._last_pred.get(track_id, (-1, 0.0))
+
+        # FIX: physics override — correct Standing/Walking confusion using hip displacement
+        _WALKING_ID = self._walking_id  # FIX: use cached Walking ID instead of scanning label_map each call
+        _STANDING_ID = self._standing_id  # FIX: use cached Standing ID instead of scanning label_map each call
+        quality = self._quality_state.get(track_id, {})  # FIX: use current quality state to avoid unsafe upright overrides
+        fall_like_context = bool(  # FIX: skip upright override when any fall-like cues are active
+            quality.get("fall_velocity", False)
+            or quality.get("strong_fall_cue", False)
+            or quality.get("moderate_fall_cue", False)
+            or quality.get("lateral_fall_cue", False)
+            or quality.get("chair_roll_cue", False)
+        )
+        looks_sit_transition = bool(quality.get("looks_sit_transition", False))  # FIX: avoid overriding sitting-transition phases
+        occluded = bool(quality.get("occluded", False))  # FIX: avoid motion override under occlusion noise
+        lower_body_ratio = float(quality.get("lower_body_ratio", 0.0))  # FIX: ensure lower-body visibility before hip-motion decision
+        valid_ratio = float(quality.get("valid_ratio", 0.0))  # FIX: ensure enough valid keypoints for robust displacement signal
+        bbox_aspect = float(quality.get("bbox_aspect_ratio", 1.0))  # FIX: restrict override to clearly upright silhouettes
+        downward_velocity = float(quality.get("downward_velocity", 0.0))  # FIX: avoid overriding while vertical motion is high
+
+        if _WALKING_ID is not None and _STANDING_ID is not None:  # FIX: run override only when both upright labels exist
+            if (
+                lid in (_WALKING_ID, _STANDING_ID)
+                and not fall_like_context
+                and not looks_sit_transition
+                and not occluded
+                and valid_ratio >= max(self.min_keypoint_ratio * 0.78, 0.52)
+                and lower_body_ratio >= 0.54
+                and bbox_aspect < 0.98
+                and abs(downward_velocity) < (self.fall_velocity_ratio * 0.55)
+                and conf <= 0.78
+            ):  # FIX: apply override only in clean upright contexts to avoid false flips
+                buf = self._buffers.get(track_id)  # FIX: read normalized keypoint history for motion-based override
+                if buf is not None and len(buf) >= 8:  # FIX: use longer short-term window for less jitter-sensitive motion estimate
+                    frames = list(buf)  # FIX: materialize deque once for indexed recent-frame access
+                    recent = frames[-8:]  # FIX: compute displacement over last 7 frame-to-frame steps
+                    hip_displacements = []  # FIX: collect per-step hip-center displacement magnitudes
+                    for fi in range(1, len(recent)):  # FIX: iterate adjacent frame pairs in the recent window
+                        prev_kp = recent[fi - 1]  # FIX: previous frame keypoints
+                        curr_kp = recent[fi]  # FIX: current frame keypoints
+                        if prev_kp is None or curr_kp is None:  # FIX: skip invalid keypoint frames defensively
+                            continue  # FIX: ignore incomplete pair when computing displacement
+                        prev_hip = (prev_kp[11] + prev_kp[12]) / 2.0  # FIX: hip center from left/right hip (normalized)
+                        curr_hip = (curr_kp[11] + curr_kp[12]) / 2.0  # FIX: hip center from left/right hip (normalized)
+                        hip_displacements.append(float(np.linalg.norm(curr_hip - prev_hip)))  # FIX: Euclidean hip displacement per frame
+                    if hip_displacements:  # FIX: continue only when at least one valid displacement sample exists
+                        avg_hip_disp = float(np.mean(hip_displacements))  # FIX: robust average displacement for upright motion state
+                        walk_threshold = 0.011  # FIX: lower walking threshold to better recover slow/short-step walking motion
+                        stand_threshold = 0.0055  # FIX: stricter stillness floor so Walking is not over-forced back to Standing
+                        if lid == _STANDING_ID and avg_hip_disp > walk_threshold:  # FIX: promote Standing -> Walking on sustained hip motion
+                            lid = _WALKING_ID  # FIX: override label ID to Walking
+                        elif lid == _WALKING_ID and avg_hip_disp < stand_threshold:  # FIX: demote Walking -> Standing only on very low hip motion
+                            lid = _STANDING_ID  # FIX: override label ID to Standing
+
+        # FIX: update cached prediction after physics override
+        if (lid, conf) != self._last_pred.get(track_id, (-1, 0.0)):  # FIX: persist override result only when prediction actually changed
+            self._last_pred[track_id] = (lid, conf)  # FIX: cache final label/conf so subsequent frames remain consistent
+
+        upright_ids = {self._walking_label_id, self._standing_label_id}
+        upright_ids.discard(None)
+        if upright_ids:
+            quality = self._quality_state.get(track_id, {})
+            occluded = bool(quality.get("occluded", False))
+            lower_body_ratio = float(quality.get("lower_body_ratio", 0.0))
+            center_motion_ratio = float(quality.get("center_motion_ratio", 0.0))
+            jitter_ratio = float(quality.get("jitter_ratio", 0.0))
+            downward_velocity = float(quality.get("downward_velocity", 0.0))
+
+            reference_prev = self._last_upright_label.get(track_id)
+            if reference_prev not in upright_ids and prev_output_label_id in upright_ids:
+                reference_prev = prev_output_label_id
+
+            votes = self._upright_motion_votes.setdefault(track_id, {"walk": 0, "stand": 0})
+
+            if lid in upright_ids and reference_prev in upright_ids and lid != reference_prev:
+                strong_walk_switch = bool(
+                    lid == self._walking_label_id
+                    and (
+                        center_motion_ratio > max(self.upright_idle_center_motion_ratio * 0.70, 0.038)
+                        or conf >= max(prev_output_conf + 0.10, 0.60)
+                    )
+                )
+                strong_stand_switch = bool(
+                    lid == self._standing_label_id
+                    and center_motion_ratio < max(self.upright_idle_center_motion_ratio * 0.16, 0.009)
+                    and jitter_ratio < max(self.upright_idle_jitter_ratio * 0.90, 0.040)
+                    and abs(downward_velocity) < (self.fall_velocity_ratio * 0.35)
+                    and conf >= max(prev_output_conf + 0.06, 0.56)
+                )
+
+                if lid == self._walking_label_id:
+                    votes["walk"] = min(votes.get("walk", 0) + 1, 5)
+                    votes["stand"] = max(votes.get("stand", 0) - 1, 0)
+                    required_votes = 1 if strong_walk_switch else 2
+                    if votes["walk"] < required_votes:
+                        lid = int(reference_prev)
+                        conf = float(max(prev_output_conf * 0.90, conf * 0.78, 0.38))
+                        quality = self._quality_state.setdefault(track_id, {})
+                        quality["rescue_applied"] = True
+                        quality["rescue_reason"] = "upright_switch_wait_walk"
+                    else:
+                        self._upright_last_switch_frame[track_id] = self._frame_count.get(track_id, 0)
+                else:
+                    votes["stand"] = min(votes.get("stand", 0) + 1, 5)
+                    votes["walk"] = max(votes.get("walk", 0) - 1, 0)
+                    required_votes = 3 if strong_stand_switch else 4
+                    if occluded and lower_body_ratio < 0.62:
+                        required_votes += 1
+                    if votes["stand"] < required_votes:
+                        lid = int(reference_prev)
+                        conf = float(max(prev_output_conf * 0.90, conf * 0.78, 0.38))
+                        quality = self._quality_state.setdefault(track_id, {})
+                        quality["rescue_applied"] = True
+                        quality["rescue_reason"] = "upright_switch_wait_stand"
+                    else:
+                        self._upright_last_switch_frame[track_id] = self._frame_count.get(track_id, 0)
+            elif lid in upright_ids:
+                if lid == self._walking_label_id:
+                    votes["walk"] = min(votes.get("walk", 0) + 1, 5)
+                    votes["stand"] = max(votes.get("stand", 0) - 1, 0)
+                else:
+                    votes["stand"] = min(votes.get("stand", 0) + 1, 5)
+                    votes["walk"] = max(votes.get("walk", 0) - 1, 0)
+
+            if lid in upright_ids:
+                self._last_upright_label[track_id] = int(lid)
+
+        if (lid, conf) != self._last_pred.get(track_id, (-1, 0.0)):
+            self._last_pred[track_id] = (lid, conf)
         return self._display_prediction(lid, conf)
 
     def predict(self, track_id: int) -> Tuple[int, float, str]:
@@ -2619,6 +2834,9 @@ class ActionRecognizerLite:
         self._last_predict_ms.pop(track_id, None)
         self._timeline_calibrator_state.pop(track_id, None)
         self._physics_vote_state.pop(track_id, None)
+        self._upright_last_switch_frame.pop(track_id, None)
+        self._last_upright_label.pop(track_id, None)
+        self._upright_motion_votes.pop(track_id, None)
 
     def reset_track(self, track_id: int) -> None:
         self._drop_track(track_id)
