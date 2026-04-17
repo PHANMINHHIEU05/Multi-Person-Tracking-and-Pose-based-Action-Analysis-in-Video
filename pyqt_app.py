@@ -1125,9 +1125,12 @@ class InferenceWorker(QThread):
                                         display_tid,
                                         {"Walking": 0, "Standing": 0},
                                     )
-                                    votes[label_name] = min(int(votes.get(label_name, 0)) + 1, 4)
+                                    votes[label_name] = min(int(votes.get(label_name, 0)) + 1, 6)
                                     votes[prev_label] = 0
-                                    required_votes = 2 if float(conf_val) < max(prev_conf + 0.06, 0.64) else 1
+                                    if label_name == "Standing":
+                                        required_votes = 5 if float(conf_val) < max(prev_conf + 0.12, 0.76) else 4
+                                    else:
+                                        required_votes = 2 if float(conf_val) < max(prev_conf + 0.05, 0.60) else 1
                                     if votes[label_name] < required_votes:
                                         label_name = prev_label
                                         conf_val = max(prev_conf * 0.92, float(conf_val) * 0.82)

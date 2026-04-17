@@ -1208,8 +1208,9 @@ class ActionRecognizerLite:
         if prev_label_id not in {self._standing_label_id, self._walking_label_id, -1}:
             return label_id, confidence, False, ""
 
-        stand_motion_ceiling = max(self.upright_idle_center_motion_ratio * 1.05, 0.050)
-        walk_motion_floor = max(self.upright_idle_center_motion_ratio * 1.18, 0.062)
+        # Tighten stillness gate for Walking->Standing so slow-walk is not demoted too early.
+        stand_motion_ceiling = max(self.upright_idle_center_motion_ratio * 0.65, 0.032)
+        walk_motion_floor = max(self.upright_idle_center_motion_ratio * 1.00, 0.050)
         stable_upright = bool(
             jitter_ratio <= max(self.upright_idle_jitter_ratio * 1.45, 0.065)
             and bbox_aspect < 1.04
@@ -1222,7 +1223,7 @@ class ActionRecognizerLite:
             clear_standing = bool(
                 stable_upright
                 and center_motion_ratio <= stand_motion_ceiling
-                and confidence >= max(prev_conf + 0.08, 0.62)
+                and confidence >= max(prev_conf + 0.12, 0.68)
             )
             if not clear_standing:
                 walk_conf = max(prev_conf * 0.94, confidence * 0.80, 0.40)
@@ -1230,7 +1231,7 @@ class ActionRecognizerLite:
 
         if prev_label_id == self._standing_label_id and label_id == self._walking_label_id:
             walk_transition = bool(
-                center_motion_ratio >= max((walk_motion_floor * 0.64), 0.030)
+                center_motion_ratio >= max((walk_motion_floor * 0.58), 0.026)
                 or confidence >= max(prev_conf * 0.92, 0.44)
                 or bbox_aspect < 0.28
             )
@@ -2535,14 +2536,14 @@ class ActionRecognizerLite:
                 )
                 strong_stand_switch = bool(
                     lid == self._standing_label_id
-                    and center_motion_ratio < max(self.upright_idle_center_motion_ratio * 0.16, 0.009)
+                    and center_motion_ratio < max(self.upright_idle_center_motion_ratio * 0.12, 0.007)
                     and jitter_ratio < max(self.upright_idle_jitter_ratio * 0.90, 0.040)
                     and abs(downward_velocity) < (self.fall_velocity_ratio * 0.35)
-                    and conf >= max(prev_output_conf + 0.06, 0.56)
+                    and conf >= max(prev_output_conf + 0.10, 0.62)
                 )
 
                 if lid == self._walking_label_id:
-                    votes["walk"] = min(votes.get("walk", 0) + 1, 5)
+                    votes["walk"] = min(votes.get("walk", 0) + 1, 7)
                     votes["stand"] = max(votes.get("stand", 0) - 1, 0)
                     required_votes = 1 if strong_walk_switch else 2
                     if votes["walk"] < required_votes:
@@ -2554,9 +2555,9 @@ class ActionRecognizerLite:
                     else:
                         self._upright_last_switch_frame[track_id] = self._frame_count.get(track_id, 0)
                 else:
-                    votes["stand"] = min(votes.get("stand", 0) + 1, 5)
+                    votes["stand"] = min(votes.get("stand", 0) + 1, 7)
                     votes["walk"] = max(votes.get("walk", 0) - 1, 0)
-                    required_votes = 3 if strong_stand_switch else 4
+                    required_votes = 5 if strong_stand_switch else 6
                     if occluded and lower_body_ratio < 0.62:
                         required_votes += 1
                     if votes["stand"] < required_votes:
@@ -2569,10 +2570,10 @@ class ActionRecognizerLite:
                         self._upright_last_switch_frame[track_id] = self._frame_count.get(track_id, 0)
             elif lid in upright_ids:
                 if lid == self._walking_label_id:
-                    votes["walk"] = min(votes.get("walk", 0) + 1, 5)
+                    votes["walk"] = min(votes.get("walk", 0) + 1, 7)
                     votes["stand"] = max(votes.get("stand", 0) - 1, 0)
                 else:
-                    votes["stand"] = min(votes.get("stand", 0) + 1, 5)
+                    votes["stand"] = min(votes.get("stand", 0) + 1, 7)
                     votes["walk"] = max(votes.get("walk", 0) - 1, 0)
 
             if lid in upright_ids:
