@@ -2499,7 +2499,7 @@ class ActionRecognizerLite:
                     if hip_displacements:  # FIX: continue only when at least one valid displacement sample exists
                         avg_hip_disp = float(np.mean(hip_displacements))  # FIX: robust average displacement for upright motion state
                         walk_threshold = 0.011  # FIX: lower walking threshold to better recover slow/short-step walking motion
-                        stand_threshold = 0.0055  # FIX: stricter stillness floor so Walking is not over-forced back to Standing
+                        stand_threshold = 0.0048  # FIX: require clearer stillness before demoting Walking -> Standing
                         if lid == _STANDING_ID and avg_hip_disp > walk_threshold:  # FIX: promote Standing -> Walking on sustained hip motion
                             lid = _WALKING_ID  # FIX: override label ID to Walking
                         elif lid == _WALKING_ID and avg_hip_disp < stand_threshold:  # FIX: demote Walking -> Standing only on very low hip motion

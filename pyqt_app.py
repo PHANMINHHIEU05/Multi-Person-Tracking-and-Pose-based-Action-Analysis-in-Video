@@ -485,8 +485,8 @@ class InferenceWorker(QThread):
                 and fps_src >= 23.0
                 and int(effective_process_stride) >= 2
             ):
-                effective_action_update_stride = max(effective_action_update_stride, 3)
-                self.status_ready.emit("Action update stride primed at 3 for dense 24+ FPS video stability.")
+                effective_action_update_stride = max(effective_action_update_stride, 2)
+                self.status_ready.emit("Action update stride primed at 2 for dense 24+ FPS video responsiveness.")
             current_pred_stride = int(getattr(recognizer, "pred_stride", 1))
             if cfg.auto_tune_cpu and cpu_only:
                 if action_backend == "torch":
@@ -599,6 +599,11 @@ class InferenceWorker(QThread):
         latest_action_submitted_at: Optional[float] = None
         latest_action_task_by_track: dict[int, int] = {}
         dynamic_action_update_stride = max(1, int(effective_action_update_stride))
+        max_dynamic_action_update_stride = 2
+        if cfg.auto_tune_cpu and cpu_only and cfg.source_mode == "video":
+            max_dynamic_action_update_stride = 4
+        elif int(effective_process_stride) >= 3:
+            max_dynamic_action_update_stride = 3
         action_busy_streak = 0
         action_relief_streak = 0
         action_lag_relief_streak = 0
@@ -614,6 +619,7 @@ class InferenceWorker(QThread):
         stable_last_bbox: dict[int, np.ndarray] = {}
         stable_last_seen: dict[int, int] = {}
         visual_state_by_id: dict[int, VisualTrackState] = {}
+        upright_switch_vote_by_id: dict[int, dict[str, int]] = {}
         unique_stable_ids: set[int] = set()
         next_stable_id = 1
         max_id_idle_frames = max(90, int(round(fps_src * 6.0)))
@@ -760,19 +766,13 @@ class InferenceWorker(QThread):
                                 if latest_action_task_by_track.get(track_id) == action_result.task_id:
                                     latest_action_task_by_track.pop(track_id, None)
                     if action_backend == "extratrees" and cfg.source_mode == "video" and not cpu_only:
-                        if action_last_lag_ms >= 220.0 and dynamic_action_update_stride < 4:
+                        if action_last_lag_ms >= 240.0 and dynamic_action_update_stride < max_dynamic_action_update_stride:
                             dynamic_action_update_stride += 1
                             action_lag_relief_streak = 0
                             self.status_ready.emit(
                                 f"Action lag {action_last_lag_ms:.0f}ms: update stride raised to {dynamic_action_update_stride}."
                             )
-                        elif action_last_lag_ms >= 140.0 and dynamic_action_update_stride < 4:
-                            dynamic_action_update_stride += 1
-                            action_lag_relief_streak = 0
-                            self.status_ready.emit(
-                                f"Action lag {action_last_lag_ms:.0f}ms: update stride raised to {dynamic_action_update_stride}."
-                            )
-                        elif action_last_lag_ms <= 80.0:
+                        elif action_last_lag_ms <= 90.0:
                             action_lag_relief_streak += 1
                             if (
                                 dynamic_action_update_stride > effective_action_update_stride
@@ -827,6 +827,7 @@ class InferenceWorker(QThread):
                     stable_last_bbox.clear()
                     stable_last_seen.clear()
                     visual_state_by_id.clear()
+                    upright_switch_vote_by_id.clear()
                     latest_action_task_by_track.clear()
                     if recognizer is not None:
                         recognizer.remove_stale_tracks(set())
@@ -949,6 +950,7 @@ class InferenceWorker(QThread):
                         stable_last_bbox.clear()
                         stable_last_seen.clear()
                         visual_state_by_id.clear()
+                        upright_switch_vote_by_id.clear()
                         latest_action_task_by_track.clear()
                         if recognizer is not None:
                             recognizer.remove_stale_tracks(set())
@@ -998,6 +1000,7 @@ class InferenceWorker(QThread):
                                 recognizer.reset_track(display_tid)
                                 latest_action_task_by_track.pop(display_tid, None)
                                 visual_state_by_id.pop(display_tid, None)
+                                upright_switch_vote_by_id.pop(display_tid, None)
                         raw_last_seen[raw_tid] = frame_idx
                         stable_last_bbox[display_tid] = bbox.copy()
                         stable_last_seen[display_tid] = frame_idx
@@ -1048,10 +1051,22 @@ class InferenceWorker(QThread):
                                         action_backend == "extratrees"
                                         and cfg.source_mode == "video"
                                         and not cpu_only
-                                        and action_busy_streak >= 2
-                                        and dynamic_action_update_stride < 4
+                                        and action_busy_streak >= 4
+                                        and dynamic_action_update_stride < max_dynamic_action_update_stride
                                     ):
                                         dynamic_action_update_stride += 1
+
+                                    # Avoid prolonged unknown labels while async worker is busy:
+                                    # run a tiny synchronous fallback only for cold-start tracks.
+                                    cold_start_ids = [
+                                        track_id
+                                        for track_id in ready_ids
+                                        if recognizer.get_last_prediction(track_id)[0] < 0
+                                    ]
+                                    if cold_start_ids:
+                                        fallback_limit = 2 if len(cold_start_ids) > 1 else 1
+                                        fallback_ids = cold_start_ids[:fallback_limit]
+                                        batch_predictions.update(recognizer.predict_batch(fallback_ids))
                                 else:
                                     submitted_task_id = action_predictor.submit(ready_ids, feature_matrix)
                                     if submitted_task_id:
@@ -1084,6 +1099,44 @@ class InferenceWorker(QThread):
                                 label_id, conf_val, label_name = batch_predictions.get(display_tid, recognizer.get_last_prediction(display_tid))
                             else:
                                 label_id, conf_val, label_name = recognizer.get_last_prediction(display_tid)
+
+                            prev_state = visual_state_by_id.get(display_tid)
+                            if prev_state is not None:
+                                prev_label = str(prev_state.label)
+                                prev_conf = float(prev_state.conf)
+
+                                # Keep last stable label when current output is unknown to avoid label flicker/dropout.
+                                if label_name in ("?", "unknown") and prev_label not in ("?", "unknown", ""):
+                                    label_name = prev_label
+                                    conf_val = max(prev_conf * 0.90, float(conf_val))
+                                    for mapped_id, mapped_name in LABEL_MAP.items():
+                                        if mapped_name == prev_label:
+                                            label_id = int(mapped_id)
+                                            break
+
+                                # Lightweight upright hysteresis at render layer:
+                                # require short confirmation before Standing<->Walking switch.
+                                if (
+                                    prev_label in {"Standing", "Walking"}
+                                    and label_name in {"Standing", "Walking"}
+                                    and label_name != prev_label
+                                ):
+                                    votes = upright_switch_vote_by_id.setdefault(
+                                        display_tid,
+                                        {"Walking": 0, "Standing": 0},
+                                    )
+                                    votes[label_name] = min(int(votes.get(label_name, 0)) + 1, 4)
+                                    votes[prev_label] = 0
+                                    required_votes = 2 if float(conf_val) < max(prev_conf + 0.06, 0.64) else 1
+                                    if votes[label_name] < required_votes:
+                                        label_name = prev_label
+                                        conf_val = max(prev_conf * 0.92, float(conf_val) * 0.82)
+                                        for mapped_id, mapped_name in LABEL_MAP.items():
+                                            if mapped_name == prev_label:
+                                                label_id = int(mapped_id)
+                                                break
+                                elif label_name in {"Standing", "Walking"}:
+                                    upright_switch_vote_by_id.pop(display_tid, None)
                         else:
                             aspect = (bbox[2] - bbox[0]) / max((bbox[3] - bbox[1]), 1e-6)
                             label_id = 0 if aspect > 1.2 else 2
@@ -1158,6 +1211,7 @@ class InferenceWorker(QThread):
                     stable_last_seen.pop(sid, None)
                     stable_last_bbox.pop(sid, None)
                     visual_state_by_id.pop(sid, None)
+                    upright_switch_vote_by_id.pop(sid, None)
 
                 held_ids = {sid for sid, last_seen in stable_last_seen.items() if frame_idx - last_seen <= track_hold_frames}
                 if should_draw_this_frame:
