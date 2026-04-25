@@ -6,8 +6,8 @@ Loss         : Focal Loss (γ=2.0) with class weights
 Optimiser    : AdamW + CosineAnnealingWarmRestarts
 Input        : (N, 128, 69) — 17 keypoints × 4 features + 1 aspect ratio
 
-5 classes:
-  0: Fall   1: Walking   2: Sitting_Quickly   3: Bending   4: Lying_Down
+Default classes (overridden by data_dir/label_map.json when available):
+    0: Fall   1: Walking   2: Sitting_Quickly   3: Bending   4: Lying_Down
 
 Output: ./runs/train_v3/final_safe_system.pth
 
@@ -49,13 +49,44 @@ from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 DATA_DIR = "./data/train_ready_horizontal"
 SAVE_DIR = "./runs/train_horizontal"
 
-LABEL_MAP = {
+DEFAULT_LABEL_MAP = {
     0: "Fall",
     1: "Walking",
     2: "Sitting_Quickly",
     3: "Bending",
     4: "Lying_Down",
 }
+
+
+def load_label_map(data_dir: str, classes: np.ndarray) -> Dict[int, str]:
+    """Load class names from dataset if present, else fallback to defaults."""
+    lm_path = os.path.join(data_dir, "label_map.json")
+    label_map: Dict[int, str] = dict(DEFAULT_LABEL_MAP)
+
+    if os.path.exists(lm_path):
+        try:
+            with open(lm_path, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+            parsed: Dict[int, str] = {}
+            if isinstance(raw, dict):
+                for k, v in raw.items():
+                    try:
+                        parsed[int(k)] = str(v)
+                    except (TypeError, ValueError):
+                        continue
+            if parsed:
+                label_map = parsed
+                print(f"  [LABEL_MAP] Loaded from {lm_path}")
+            else:
+                print(f"  [LABEL_MAP] Invalid {lm_path}, fallback to default")
+        except Exception as e:
+            print(f"  [LABEL_MAP] Failed to load ({e}), fallback to default")
+    else:
+        print("  [LABEL_MAP] label_map.json not found, using default")
+
+    resolved = {int(c): label_map.get(int(c), f"C{int(c)}") for c in classes}
+    print(f"  [LABEL_MAP] Active: {resolved}")
+    return resolved
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -518,17 +549,26 @@ def main():
         use_scaler = False
         print("  [SCALER] Not found — skipping normalization")
 
-    num_classes = len(np.unique(y))
+    classes = np.unique(y)
+    expected = np.arange(len(classes))
+    if not np.array_equal(classes, expected):
+        raise ValueError(
+            f"Class ids must be contiguous from 0..C-1, got {classes.tolist()}"
+        )
+
+    num_classes = len(classes)
     if num_classes != args.num_classes:
         print(f"  [AUTO] num_classes → {num_classes}")
         args.num_classes = num_classes
+
+    label_map = load_label_map(args.data_dir, classes)
 
     X_train, X_val, y_train, y_val = train_test_split(
         X, y, test_size=args.val_ratio, random_state=args.seed, stratify=y)
     print(f"  Train: {len(X_train)}   Val: {len(X_val)}")
     for name, sy in [("Train", y_train), ("Val", y_val)]:
         cls, cnt = np.unique(sy, return_counts=True)
-        d = ", ".join(f"{LABEL_MAP.get(int(c), c)}:{n}" for c, n in zip(cls, cnt))
+        d = ", ".join(f"{label_map.get(int(c), c)}:{n}" for c, n in zip(cls, cnt))
         print(f"  {name}: {d}")
 
     # ── Loaders ───────────────────────────────────────────────────────────
@@ -605,7 +645,7 @@ def main():
                 "optimizer_state_dict": optimizer.state_dict(),
                 "val_acc": vl_acc, "val_f1": vl_f1, "val_loss": vl_loss,
                 "args": vars(args),
-                "label_map": LABEL_MAP,
+                "label_map": label_map,
                 "feat_mean": feat_mean,
                 "feat_std":  feat_std,
             }, ckpt_path)
@@ -632,7 +672,7 @@ def main():
     _, final_acc, final_pred, final_true = evaluate(
         model, val_dl, criterion, device, use_amp)
 
-    names = [LABEL_MAP.get(i, f"C{i}") for i in range(args.num_classes)]
+    names = [label_map.get(i, f"C{i}") for i in range(args.num_classes)]
     print(f"\n  Best epoch  : {best_epoch}")
     print(f"  Best val acc: {best_acc:.4f} ({best_acc:.2%})")
     print(f"  Best val F1 : {best_f1:.4f}")

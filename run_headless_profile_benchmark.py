@@ -18,7 +18,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--video", required=True, help="Input video path")
     parser.add_argument(
         "--profiles",
-        default="quality,fast,balanced",
+        default="fast,balanced,quality",
         help="Comma-separated profile names in order",
     )
     parser.add_argument(

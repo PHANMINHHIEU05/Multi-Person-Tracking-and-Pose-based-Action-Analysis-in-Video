@@ -42,7 +42,6 @@ from PyQt6.QtWidgets import (
 
 from src.runtime_shared import (
     ActionRecognizerLite,
-    LABEL_MAP,
     ROOT,
     describe_pose_runtime,
     bbox_center_distance_norm,
@@ -474,7 +473,12 @@ class InferenceWorker(QThread):
                 and not bool(cfg.auto_tune_cpu)
             )
             if action_backend == "torch":
-                effective_action_update_stride = 2 if cfg.source_mode == "webcam" else 3
+                # Torch backend on GPU has enough headroom; keep action updates dense
+                # to avoid missing short fall transitions.
+                if cpu_only:
+                    effective_action_update_stride = 2 if cfg.source_mode == "webcam" else 3
+                else:
+                    effective_action_update_stride = 1
             else:
                 effective_action_update_stride = 1 if cfg.source_mode == "webcam" else 2
             if (
@@ -631,10 +635,12 @@ class InferenceWorker(QThread):
         # Scene-cut logic tuned to avoid over-resetting on motion-heavy clips.
         # We still detect hard transitions, but require stronger evidence + debounce.
         scene_stride_factor = max(1.0, float(effective_process_stride))
-        scene_cut_diff_threshold = 4.4 + 0.4 * (scene_stride_factor - 1.0)
-        scene_cut_min_gap = max(14, int(round(fps_src * 0.60)))
-        scene_cut_pixel_delta_threshold = 20.0
-        scene_cut_pixel_change_ratio = 0.13
+        # Montage videos often keep similar backgrounds; keep moderately sensitive cut detection
+        # while avoiding excessive resets on fast motion segments.
+        scene_cut_diff_threshold = 4.0 + 0.35 * (scene_stride_factor - 1.0)
+        scene_cut_min_gap = max(12, int(round(fps_src * 0.50)))
+        scene_cut_pixel_delta_threshold = 18.0
+        scene_cut_pixel_change_ratio = 0.115
         last_scene_cut_frame = -10_000
         prev_scene_signature: Optional[np.ndarray] = None
         prev_scene_diff = 0.0
@@ -975,9 +981,27 @@ class InferenceWorker(QThread):
                         display_tid = resolve_display_id(raw_tid, bbox, assigned_stable_ids)
                         assigned_stable_ids.add(display_tid)
                         unique_stable_ids.add(display_tid)
+                        needs_kpts = cfg.draw_skeleton or recognizer is not None
+                        kpts = extract_kpts_for_track(result, raw_tid, frame.shape[1], frame.shape[0]) if needs_kpts else None
+                        bbox_norm = np.array(
+                            [
+                                bbox[0] / max(frame.shape[1], 1),
+                                bbox[1] / max(frame.shape[0], 1),
+                                bbox[2] / max(frame.shape[1], 1),
+                                bbox[3] / max(frame.shape[0], 1),
+                            ],
+                            dtype=np.float32,
+                        )
+
                         prev_display_bbox = stable_last_bbox.get(display_tid)
                         prev_display_seen = stable_last_seen.get(display_tid, -10_000)
                         if recognizer is not None and prev_display_bbox is not None and frame_idx > prev_display_seen:
+                            prev_visual_state = visual_state_by_id.get(display_tid)
+                            prev_display_kpts = (
+                                prev_visual_state.kpts
+                                if prev_visual_state is not None and prev_visual_state.kpts is not None
+                                else None
+                            )
                             prev_w = max(float(prev_display_bbox[2] - prev_display_bbox[0]), 1e-3)
                             prev_h = max(float(prev_display_bbox[3] - prev_display_bbox[1]), 1e-3)
                             curr_w = max(float(bbox[2] - bbox[0]), 1e-3)
@@ -985,17 +1009,49 @@ class InferenceWorker(QThread):
                             area_ratio = (curr_w * curr_h) / max(prev_w * prev_h, 1e-3)
                             iou = bbox_iou_xyxy(bbox, prev_display_bbox)
                             dist = bbox_center_distance_norm(bbox, prev_display_bbox)
+                            reappear_gap = int(frame_idx - prev_display_seen)
                             _, _, prev_label_name = recognizer.get_last_prediction(display_tid)
                             carryover_sensitive = prev_label_name in {"Fall", "Lying_Down"}
                             carryover_hard_jump = iou < 0.05 and (dist > 0.55 or area_ratio < 0.55 or area_ratio > 1.90)
                             generic_hard_jump = iou < 0.03 and dist > 0.72 and (area_ratio < 0.50 or area_ratio > 2.20)
                             scene_context_jump = scene_cut_change_ratio >= (scene_cut_pixel_change_ratio * 0.45)
                             extreme_jump = dist > 0.95
+                            pose_hard_jump = False
+                            if prev_display_kpts is not None and kpts is not None:
+                                valid_prev = ~np.all(prev_display_kpts == 0, axis=1)
+                                valid_curr = ~np.all(kpts == 0, axis=1)
+                                valid_joint_mask = valid_prev & valid_curr
+                                if int(valid_joint_mask.sum()) >= 6:
+                                    joint_delta = np.linalg.norm(
+                                        kpts[valid_joint_mask] - prev_display_kpts[valid_joint_mask],
+                                        axis=1,
+                                    )
+                                    median_joint_delta = float(np.median(joint_delta))
+                                    p85_joint_delta = float(np.percentile(joint_delta, 85))
+                                    pose_hard_jump = bool(
+                                        (
+                                            median_joint_delta > 0.24
+                                            and p85_joint_delta > 0.36
+                                            and iou < 0.30
+                                        )
+                                        or (median_joint_delta > 0.18 and iou < 0.12 and dist > 0.32)
+                                        or (
+                                            median_joint_delta > 0.16
+                                            and reappear_gap >= max(10, int(round(fps_src * 0.40)))
+                                            and iou < 0.28
+                                        )
+                                    )
+                            reentry_sensitive_jump = bool(
+                                carryover_sensitive
+                                and reappear_gap >= max(12, int(round(fps_src * 0.50)))
+                                and (iou < 0.20 or dist > 0.60)
+                            )
                             reset_on_jump = (
                                 (carryover_hard_jump or extreme_jump)
                                 if carryover_sensitive
                                 else (generic_hard_jump and scene_context_jump)
                             )
+                            reset_on_jump = bool(reset_on_jump or pose_hard_jump or reentry_sensitive_jump)
                             if reset_on_jump:
                                 recognizer.reset_track(display_tid)
                                 latest_action_task_by_track.pop(display_tid, None)
@@ -1008,17 +1064,6 @@ class InferenceWorker(QThread):
 
                         needs_action_update = recognizer is not None and (
                             action_update_due or recognizer.get_last_prediction(display_tid)[0] < 0
-                        )
-                        needs_kpts = cfg.draw_skeleton or recognizer is not None
-                        kpts = extract_kpts_for_track(result, raw_tid, frame.shape[1], frame.shape[0]) if needs_kpts else None
-                        bbox_norm = np.array(
-                            [
-                                bbox[0] / max(frame.shape[1], 1),
-                                bbox[1] / max(frame.shape[0], 1),
-                                bbox[2] / max(frame.shape[1], 1),
-                                bbox[3] / max(frame.shape[0], 1),
-                            ],
-                            dtype=np.float32,
                         )
 
                         if recognizer is not None:
@@ -1088,6 +1133,19 @@ class InferenceWorker(QThread):
                                 action_relief_streak += 1
                                 action_busy_streak = 0
                                 batch_predictions = recognizer.predict_batch(pending_prediction_ids)
+                        else:
+                            # Torch backend has no async predictor; run synchronous batch/loop prediction.
+                            sync_started = time.perf_counter()
+                            batch_predictions = recognizer.predict_batch(pending_prediction_ids)
+                            sync_elapsed_ms = (time.perf_counter() - sync_started) * 1000.0
+                            if batch_predictions:
+                                action_request_count += 1
+                                action_completed_count += 1
+                                action_last_lag_ms = sync_elapsed_ms
+                                action_max_lag_ms = max(action_max_lag_ms, sync_elapsed_ms)
+                            action_busy_streak = 0
+                            action_relief_streak += 1
+                            action_lag_relief_streak = 0
 
                     for entry in track_entries:
                         display_tid = int(entry["display_tid"])
@@ -1099,6 +1157,7 @@ class InferenceWorker(QThread):
                                 label_id, conf_val, label_name = batch_predictions.get(display_tid, recognizer.get_last_prediction(display_tid))
                             else:
                                 label_id, conf_val, label_name = recognizer.get_last_prediction(display_tid)
+                            active_label_map = dict(getattr(recognizer, "label_map", {}))
 
                             prev_state = visual_state_by_id.get(display_tid)
                             if prev_state is not None:
@@ -1109,7 +1168,7 @@ class InferenceWorker(QThread):
                                 if label_name in ("?", "unknown") and prev_label not in ("?", "unknown", ""):
                                     label_name = prev_label
                                     conf_val = max(prev_conf * 0.90, float(conf_val))
-                                    for mapped_id, mapped_name in LABEL_MAP.items():
+                                    for mapped_id, mapped_name in active_label_map.items():
                                         if mapped_name == prev_label:
                                             label_id = int(mapped_id)
                                             break
@@ -1134,7 +1193,7 @@ class InferenceWorker(QThread):
                                     if votes[label_name] < required_votes:
                                         label_name = prev_label
                                         conf_val = max(prev_conf * 0.92, float(conf_val) * 0.82)
-                                        for mapped_id, mapped_name in LABEL_MAP.items():
+                                        for mapped_id, mapped_name in active_label_map.items():
                                             if mapped_name == prev_label:
                                                 label_id = int(mapped_id)
                                                 break
@@ -1144,7 +1203,7 @@ class InferenceWorker(QThread):
                             aspect = (bbox[2] - bbox[0]) / max((bbox[3] - bbox[1]), 1e-6)
                             label_id = 0 if aspect > 1.2 else 2
                             conf_val = 0.50
-                            label_name = LABEL_MAP.get(label_id, "Walking")
+                            label_name = "Fall" if label_id == 0 else "Walking"
 
                         if recognizer is not None and timeline_debug_due:  # FIX: gate debug-state/timeline work by preview stride
                             debug_state = recognizer.get_debug_state(display_tid)
@@ -1155,6 +1214,11 @@ class InferenceWorker(QThread):
                                 "tid": int(display_tid),
                                 "label": str(timeline_label),
                                 "conf": float(conf_val),
+                                "raw_label_name": str(debug_state.get("raw_label_name", "?")),
+                                "raw_conf": float(debug_state.get("raw_confidence", 0.0)),
+                                "final_label_name": str(debug_state.get("final_label_name", timeline_label)),
+                                "postprocess_mode": str(debug_state.get("postprocess_mode", "")),
+                                "postprocess_reason": str(debug_state.get("postprocess_reason", "")),
                                 "fall_cue": bool(
                                     debug_state.get("strong_fall_cue", False)
                                     or debug_state.get("moderate_fall_cue", False)
@@ -1165,6 +1229,8 @@ class InferenceWorker(QThread):
                                 "fall_recovery_votes": int(debug_state.get("fall_recovery_votes", 0)),
                                 "down_vel": float(debug_state.get("downward_velocity", 0.0)),
                                 "bbox_ar": float(debug_state.get("bbox_aspect_ratio", 1.0)),
+                                "edge": bool(debug_state.get("edge_contact", False)),
+                                "edge_margin": float(debug_state.get("edge_margin", 1.0)),
                                 "resc": str(debug_state.get("rescue_reason", "")),
                             }
                             timeline_records.append(rec)
