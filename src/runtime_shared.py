@@ -1704,6 +1704,25 @@ class ActionRecognizerLite:
                 self._pending_fall_until[track_id] = frame_count + self.fall_hold_frames
                 return self._fall_label_id, fall_conf, True, "sit_post_fall_to_fall"
 
+        startup_vertical_sit = bool(
+            frame_count <= max(self.min_track_frames + 6, 12)
+            and not active_fall_cue
+            and not looks_sit_transition
+            and bbox_aspect < 0.42
+            and abs(downward_velocity) < (self.fall_velocity_ratio * 0.85)
+        )
+        if startup_vertical_sit:
+            if prev_label_id in {self._walking_label_id, self._standing_label_id}:
+                keep_conf = max(prev_conf * 0.92, confidence * 0.76, 0.38)
+                return prev_label_id, keep_conf, True, "sit_startup_vertical_keep_upright"
+            if center_motion_ratio >= max(self.upright_idle_center_motion_ratio * 0.65, 0.030):
+                walk_conf = max(confidence * 0.74, 0.38)
+                return self._walking_label_id, walk_conf, True, "sit_startup_vertical_to_walking"
+            if self._standing_label_id is not None:
+                stand_conf = max(confidence * 0.72, 0.38)
+                return self._standing_label_id, stand_conf, True, "sit_startup_vertical_to_standing"
+            return -1, 0.0, True, "sit_startup_vertical_unknown"
+
         transition_supported_sit = bool(
             looks_sit_transition
             and 0.34 <= bbox_aspect < 1.22
@@ -2363,6 +2382,23 @@ class ActionRecognizerLite:
                 and not chair_roll_cue
                 and not fall_velocity
             )
+            confident_edge_sitting = bool(
+                label_id in self._sitting_label_ids
+                and no_active_fall_signal
+                and confidence >= max(self.conf_threshold + 0.12, 0.62)
+                and edge_contact
+                and edge_margin < 0.035
+                and bbox_aspect < 0.62
+                and abs(downward_velocity) < (self.fall_velocity_ratio * 0.75)
+            )
+            if confident_edge_sitting:
+                # When a seated person leaves the frame, the center can jump and
+                # leave a stale fall hold active. Trust a high-confidence raw
+                # Sitting prediction if there is no current fall physics signal.
+                self._pending_fall_until.pop(track_id, None)
+                self._fall_recovery_votes.pop(track_id, None)
+                self._fall_candidate_votes[track_id] = 0
+                return label_id, max(confidence, prev_conf * 0.70, 0.50), True, "fall_hold_edge_sitting_release"
             if label_id in {self._standing_label_id, self._walking_label_id}:
                 prone_settle_during_hold = bool(
                     no_active_fall_signal
@@ -3141,6 +3177,8 @@ class ActionRecognizerLite:
             lower_body_ratio_now = float(quality.get("lower_body_ratio", 0.0))
             downward_velocity_now = float(quality.get("downward_velocity", 0.0))
             center_motion_ratio_now = float(quality.get("center_motion_ratio", 0.0))
+            edge_contact_now = bool(quality.get("edge_contact", False))
+            edge_margin_now = float(quality.get("edge_margin", 1.0))
             frame_count_now = self._frame_count.get(track_id, 0)
             last_fall_frame = int(self._last_fall_frame.get(track_id, -10_000))
             recent_fall_output = bool(
@@ -3157,9 +3195,24 @@ class ActionRecognizerLite:
                 and center_motion_ratio_now < max(self.upright_idle_center_motion_ratio * 1.80, 0.085)
                 and recent_sit_votes >= 2
             )
+            confident_edge_sit_after_false_fall = bool(
+                not fall_signal_now
+                and confidence >= max(self.conf_threshold + 0.12, 0.62)
+                and edge_contact_now
+                and edge_margin_now < 0.035
+                and 0.28 <= bbox_aspect_now < 0.62
+                and abs(downward_velocity_now) < (self.fall_velocity_ratio * 0.75)
+            )
+            if confident_edge_sit_after_false_fall:
+                self._pending_fall_until.pop(track_id, None)
+                self._fall_recovery_votes.pop(track_id, None)
+                self._fall_candidate_votes[track_id] = 0
+                quality["rescue_applied"] = True
+                quality["rescue_reason"] = "sit_gate_edge_release_recent_fall"
 
             recent_fall_to_sit_block = bool(
                 recent_fall_output
+                and not confident_edge_sit_after_false_fall
                 and (
                     not sit_after_recent_fall_plausible
                     or (

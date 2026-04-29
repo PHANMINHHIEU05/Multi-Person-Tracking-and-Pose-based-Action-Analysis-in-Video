@@ -1913,7 +1913,7 @@ class MainWindow(QMainWindow):
             self.normalize_timing_checkbox.setChecked(False)
             self.target_analysis_fps_spin.setValue(12.0)
             self.pred_stride_spin.setValue(1)
-            self.min_track_frames_spin.setValue(12)  # FIX: 30 was too high; allow earlier action prediction
+            self.min_track_frames_spin.setValue(6)  # Short fall clips need labels before the person has already hit the ground.
             self.action_conf_spin.setValue(0.31)
             self.smooth_window_spin.setValue(3)
             self.fall_conf_boost_spin.setValue(0.08)
