@@ -3060,8 +3060,75 @@ class ActionRecognizerLite:
             downward_velocity = float(quality.get("downward_velocity", 0.0))
             center_motion_ratio = float(quality.get("center_motion_ratio", 0.0))
             area_ratio = float(quality.get("area_ratio", 1.0))
+            bbox_aspect = float(quality.get("bbox_aspect_ratio", 1.0))
+            lower_body_ratio = float(quality.get("lower_body_ratio", 0.0))
+            hip_to_ankle_ratio = float(quality.get("hip_to_ankle_ratio", 0.0))
 
             entering_lying_from_non_fall = bool(prev_label_id not in {self._fall_label_id, self._lying_label_id})
+            vertical_no_cue_lying = bool(
+                entering_lying_from_non_fall
+                and not fall_velocity
+                and not strong_fall_cue
+                and not moderate_fall_cue
+                and not lateral_fall_cue
+                and not chair_roll_cue
+                and bbox_aspect < 0.68
+                and abs(downward_velocity) < (self.fall_velocity_ratio * 0.75)
+                and center_motion_ratio < max(self.upright_idle_center_motion_ratio * 1.10, 0.055)
+                and self._pending_fall_until.get(track_id, 0) <= frame_count
+            )
+            if vertical_no_cue_lying:
+                # Cross-legged sitting or deep forward bending can look like
+                # Lying_Down to the sequence model, but the person is still
+                # vertically framed and has no fall physics cue.
+                quality = self._quality_state.setdefault(track_id, {})
+                quality["rescue_applied"] = True
+                if bbox_aspect < 0.42:
+                    # Very narrow upright boxes are standing/walking, not sitting.
+                    if (
+                        self._walking_label_id is not None
+                        and center_motion_ratio >= max(self.upright_idle_center_motion_ratio * 0.75, 0.034)
+                    ):
+                        fallback_id = int(self._walking_label_id)
+                        quality["rescue_reason"] = "lying_vertical_no_cue_to_walking"
+                    elif self._standing_label_id is not None:
+                        fallback_id = int(self._standing_label_id)
+                        quality["rescue_reason"] = "lying_vertical_no_cue_to_standing"
+                    elif self._walking_label_id is not None:
+                        fallback_id = int(self._walking_label_id)
+                        quality["rescue_reason"] = "lying_vertical_no_cue_to_walking"
+                    else:
+                        fallback_id = -1
+                        quality["rescue_reason"] = "lying_vertical_no_cue_unknown"
+                else:
+                    upright_crouch_like = bool(
+                        prev_label_id in {self._standing_label_id, self._walking_label_id}
+                        and lower_body_ratio >= 0.45
+                        and hip_to_ankle_ratio >= 0.12
+                    )
+                    sitting_geometry = bool(
+                        lower_body_ratio >= 0.34
+                        and hip_to_ankle_ratio >= 0.08
+                    )
+                    if upright_crouch_like:
+                        fallback_id = int(prev_label_id)
+                        quality["rescue_reason"] = "lying_vertical_no_cue_keep_upright"
+                    elif sitting_geometry:
+                        fallback_id = next(iter(self._sitting_label_ids), -1)
+                        quality["rescue_reason"] = "lying_vertical_no_cue_to_sitting"
+                        if fallback_id < 0 and self._standing_label_id is not None:
+                            fallback_id = int(self._standing_label_id)
+                    else:
+                        # Folded legs above the hip are common right after a fall;
+                        # keeping Lying_Down is safer than inventing Sitting.
+                        fallback_id = -1
+                        quality["rescue_applied"] = False
+                        quality["rescue_reason"] = ""
+                if fallback_id >= 0:
+                    fallback_conf = max(confidence * 0.82, prev_conf * 0.88, 0.42)
+                    self._last_pred[track_id] = (int(fallback_id), float(fallback_conf))
+                    return self._display_prediction(int(fallback_id), float(fallback_conf))
+
             fast_lying_impact = bool(
                 fall_velocity
                 or strong_fall_cue
@@ -3185,6 +3252,9 @@ class ActionRecognizerLite:
                 (frame_count_now - last_fall_frame) <= max(self.fall_hold_frames + 4, 10)
                 or (self._pending_fall_until.get(track_id, 0) >= frame_count_now - 1)
             )
+            extended_recent_fall_output = bool(
+                (frame_count_now - last_fall_frame) <= max(self.fall_hold_frames * 6, 36)
+            )
             hist_now = self._pred_history.get(track_id, [])
             recent_sit_votes = int(sum(1 for x in hist_now[-3:] if x in self._sitting_label_ids))
             sit_after_recent_fall_plausible = bool(
@@ -3210,9 +3280,24 @@ class ActionRecognizerLite:
                 quality["rescue_applied"] = True
                 quality["rescue_reason"] = "sit_gate_edge_release_recent_fall"
 
+            folded_post_fall_sit = bool(
+                extended_recent_fall_output
+                and not confident_edge_sit_after_false_fall
+                and not fall_signal_now
+                and prev_output_label_id in {self._fall_label_id, self._lying_label_id}
+                and bbox_aspect_now >= 0.74
+                and abs(downward_velocity_now) < (self.fall_velocity_ratio * 0.95)
+            )
+            if folded_post_fall_sit and self._lying_label_id is not None:
+                label_id = int(self._lying_label_id)
+                confidence = max(confidence * 0.82, prev_output_conf * 0.90, 0.44)
+                quality["rescue_applied"] = True
+                quality["rescue_reason"] = "sit_gate_folded_post_fall_to_lying"
+
             recent_fall_to_sit_block = bool(
                 recent_fall_output
                 and not confident_edge_sit_after_false_fall
+                and not folded_post_fall_sit
                 and (
                     not sit_after_recent_fall_plausible
                     or (
