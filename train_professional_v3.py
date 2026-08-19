@@ -99,7 +99,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--data_dir", type=str, default=DATA_DIR)
     p.add_argument("--save_dir", type=str, default=SAVE_DIR)
 
-    # Model
+    # Model config:
+    # Moi mau dau vao la 128 frame, moi frame co 69 feature tu khung xuong.
+    # 69 = 17 keypoints * (x, y, velocity, acceleration) + 1 bbox aspect ratio.
     p.add_argument("--input_dim", type=int, default=69,
                    help="17 kpts × 4 + 1 aspect ratio")
     p.add_argument("--hidden_dim", type=int, default=128)
@@ -108,11 +110,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--num_classes", type=int, default=5)
     p.add_argument("--dropout", type=float, default=0.4)
 
-    # Focal Loss
+    # Focal Loss giup model tap trung hon vao mau kho / lop it du lieu.
     p.add_argument("--focal_gamma", type=float, default=2.0,
                    help="Focusing parameter for Focal Loss")
 
-    # Training
+    # Training config chinh cua ban train cuoi:
+    # AdamW + CosineAnnealingWarmRestarts + EarlyStopping.
     p.add_argument("--epochs", type=int, default=300)
     p.add_argument("--batch_size", type=int, default=64)
     p.add_argument("--lr", type=float, default=8e-4)
@@ -163,10 +166,14 @@ class FocalLoss(nn.Module):
     def forward(self, inputs: torch.Tensor,
                 targets: torch.Tensor) -> torch.Tensor:
         """inputs: (B, C) logits,  targets: (B,) class indices."""
+        # Cross Entropy tinh loi phan loai co ban.
+        # self.weight la class weight, dung de bu cho lop it mau nhu Standing.
         ce = F.cross_entropy(inputs, targets, weight=self.weight,
                              label_smoothing=self.label_smoothing,
                              reduction="none")
+        # pt cang cao nghia la model cang doan dung va chac chan.
         pt = torch.exp(-ce)                        # p_t for correct class
+        # Mau de se bi giam trong so; mau kho giu loss cao hon de model hoc ky.
         focal = ((1.0 - pt) ** self.gamma) * ce
 
         if self.reduction == "mean":
@@ -209,17 +216,18 @@ class PoseDataset(Dataset):
 
     @staticmethod
     def _augment(x: torch.Tensor) -> torch.Tensor:
+        # non_pad danh dau frame co du lieu that, tranh them nhieu vao frame padding.
         non_pad = x.abs().sum(dim=-1) > 0
-        # Gaussian noise
+        # Them nhieu nhe vao feature khung xuong de model chiu duoc pose rung/sai so.
         if random.random() < 0.5:
             noise = torch.randn_like(x) * 0.005
             noise[~non_pad] = 0
             x = x + noise
-        # Random scaling (0.95–1.05)
+        # Scale nhe de gia lap nguoi dung gan/xa camera khac nhau.
         if random.random() < 0.3:
             scale = 0.95 + random.random() * 0.1
             x[non_pad] *= scale
-        # Temporal shift (1–3 frames)
+        # Dich chuoi theo thoi gian de model bot phu thuoc vao dung thoi diem bat dau hanh dong.
         if random.random() < 0.3:
             shift = random.randint(-3, 3)
             if shift:
@@ -244,6 +252,7 @@ class SelfAttentionPooling(nn.Module):
             embed_dim=hidden_dim, num_heads=num_heads,
             dropout=dropout, batch_first=True,
         )
+        # Residual + LayerNorm giup attention hoc on dinh hon khi chuoi dai.
         self.norm1 = nn.LayerNorm(hidden_dim)
         self.ff = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim * 2),
@@ -252,19 +261,23 @@ class SelfAttentionPooling(nn.Module):
             nn.Linear(hidden_dim * 2, hidden_dim),
         )
         self.norm2 = nn.LayerNorm(hidden_dim)
+        # pool_fc tao diem quan trong cho tung frame trong chuoi 128 frame.
         self.pool_fc = nn.Linear(hidden_dim, 1, bias=False)
 
     def forward(self, x: torch.Tensor,
                 mask: Optional[torch.Tensor] = None,
                 ) -> Tuple[torch.Tensor, torch.Tensor]:
         kpm = (~mask) if mask is not None else None
+        # Self-attention cho moi frame "nhin" cac frame khac trong cung hanh dong.
         attn_out, _ = self.self_attn(x, x, x, key_padding_mask=kpm)
         x = self.norm1(x + attn_out)
         x = self.norm2(x + self.ff(x))
+        # scores -> weights: frame nao quan trong hon se duoc gan trong so cao hon.
         scores = self.pool_fc(x).squeeze(-1)
         if mask is not None:
             scores = scores.masked_fill(~mask, float("-inf"))
         weights = F.softmax(scores, dim=-1)
+        # context la vector tong hop ca chuoi sau khi nhan trong so attention.
         context = torch.bmm(weights.unsqueeze(1), x).squeeze(1)
         return context, weights
 
@@ -284,13 +297,16 @@ class ActionRecognitionModel(nn.Module):
         self.hidden_dim = hidden_dim
         bi_dim = hidden_dim * 2
 
+        # Chuan hoa 69 feature dau vao truoc khi dua vao model.
         self.input_norm = nn.LayerNorm(input_dim)
+        # Chieu 69 feature len hidden_dim=128 de GRU hoc bieu dien giau hon.
         self.input_proj = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.ReLU(),
             nn.Dropout(dropout * 0.5),
         )
 
+        # Bi-GRU doc chuoi theo 2 chieu, hoc bien doi tu the theo thoi gian.
         self.rnn = nn.GRU(
             input_size=hidden_dim, hidden_size=hidden_dim,
             num_layers=num_layers, batch_first=True,
@@ -299,11 +315,13 @@ class ActionRecognitionModel(nn.Module):
         )
         self.rnn_norm = nn.LayerNorm(bi_dim)
 
+        # Attention chon cac frame quan trong, vi du khoanh khac bat dau nga.
         self.attention = SelfAttentionPooling(
             hidden_dim=bi_dim, num_heads=num_heads,
             dropout=dropout * 0.25,
         )
 
+        # MLP classifier bien vector context thanh 5 logits hanh dong.
         self.classifier = nn.Sequential(
             nn.Linear(bi_dim, hidden_dim),
             nn.ReLU(),
@@ -330,11 +348,14 @@ class ActionRecognitionModel(nn.Module):
                     nn.init.zeros_(m.bias)
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        # mask bo qua frame padding/toan 0 khi tinh attention.
         mask = x.abs().sum(dim=-1) > 0
         x = self.input_norm(x)
         x = self.input_proj(x)
+        # rnn_out giu thong tin dong hoc cua ca chuoi keypoints.
         rnn_out, _ = self.rnn(x)
         rnn_out = self.rnn_norm(rnn_out)
+        # attn_w co the dung de xem model dang tap trung vao frame nao.
         context, attn_w = self.attention(rnn_out, mask)
         logits = self.classifier(context)
         return logits, attn_w

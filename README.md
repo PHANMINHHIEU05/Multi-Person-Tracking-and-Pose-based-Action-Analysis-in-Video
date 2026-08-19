@@ -1,250 +1,327 @@
-# Multi-Person Tracking & Pose-based Action Analysis
+# Multi-Person Tracking and Pose-based Action Recognition
 
 ## 1. Project Overview
 
-This project implements a real-time multi-person tracking and pose-based action recognition system. It detects people in a video stream, maintains consistent identities (IDs) across frames, estimates body pose, and classifies actions per person using a trained pose-sequence model.
+This project is a real-time computer vision system for multi-person tracking and pose-based human action recognition. It detects people, estimates 17 COCO body keypoints, maintains track IDs across frames, and classifies each person's action from a temporal keypoint sequence.
 
-The system is built as a modular computer vision pipeline combining YOLOv8, BoT-SORT tracking, and pose-sequence action recognition models. The active desktop runtime now uses the repaired ExtraTrees 6-class artifact internally, while presenting a simpler 5-action view in the UI.
+Current visible action classes:
 
-As of April 9, 2026, the runtime strategy has been adjusted for higher real-video stability: the app now restores the stronger 6-class internal artifact and uses label display mapping so users still see `Fall / Standing / Walking / Sitting / Lying_Down`, while the internal `Bending` class acts as an ambiguity buffer for occluded or transitional poses.
+| ID | Action |
+|---:|---|
+| 0 | Fall |
+| 1 | Standing |
+| 2 | Walking |
+| 3 | Sitting |
+| 4 | Lying_Down |
 
-**Core capabilities:**
-- Detect and track multiple persons simultaneously with stable IDs
-- Handle partial occlusions and ID switches via Feature Memory Bank
-- Extract 17-keypoint COCO pose per tracked person every frame
-- Classify actions in real-time: **Fall | Standing | Walking | Sitting | Lying Down**
-- Operates on CPU-only systems (no GPU required)
+Current active action model:
+
+```text
+runs/train_bigru_prod5_best_v1/final_safe_system.pth
+```
+
+The active model is a PyTorch Bi-GRU + Multi-Head Self-Attention model trained on pose-sequence features.
+
+Core capabilities:
+
+- Real-time person detection and pose estimation with YOLOv8n-Pose.
+- Multi-person tracking with ByteTrack or BoT-SORT.
+- Per-track keypoint buffering and temporal action recognition.
+- PyQt6 desktop UI for video/webcam demo.
+- Optional TensorRT acceleration for YOLO pose inference.
+- Debug timeline output for analyzing model/runtime errors.
 
 ---
 
-## 2. Quick Start
+## 2. Main Runtime
+
+Recommended PyQt6 runtime:
 
 ```bash
-# Install dependencies
-pip install -r requirements.txt
-
-# Launch the primary PyQt6 desktop UI
+cd /home/hiubeo/Documents/code/Multi-Person-Tracking-and-Pose-based-Action-Analysis-in-Video
 source .trt-export-venv/bin/activate
 python pyqt_app.py
+```
 
-# Fallback runtime without TensorRT
+Fallback runtime without TensorRT environment:
+
+```bash
+cd /home/hiubeo/Documents/code/Multi-Person-Tracking-and-Pose-based-Action-Analysis-in-Video
 source .venv/bin/activate
 python pyqt_app.py
+```
 
-# Optional: export TensorRT pose engine on an NVIDIA RTX machine
-# Uses the dedicated Python 3.12 TensorRT export environment created for this project.
+If installing from a clean machine:
+
+```bash
+pip install -r requirements.txt
+python pyqt_app.py
+```
+
+The app automatically uses TensorRT pose inference if `yolov8n-pose.engine` exists and the current Python environment supports TensorRT. Otherwise, it falls back to PyTorch inference with `yolov8n-pose.pt`.
+
+---
+
+## 3. Runtime Pipeline
+
+```text
+Video / Webcam
+    -> YOLOv8n-Pose person + keypoint detection
+    -> ByteTrack or BoT-SORT tracking
+    -> Track ID based keypoint buffer
+    -> Feature sequence creation: 128 frames x 69 features
+    -> Bi-GRU action model
+    -> Runtime smoothing / state rules
+    -> PyQt6 visualization + optional annotated output video
+```
+
+Feature sequence format:
+
+| Feature group | Dimension |
+|---|---:|
+| 17 normalized keypoints x,y | 34 |
+| 17 keypoint velocities | 17 |
+| 17 keypoint accelerations | 17 |
+| Bounding-box aspect ratio | 1 |
+| Total per frame | 69 |
+
+---
+
+## 4. Desktop UI Profiles
+
+The PyQt6 app provides three runtime profiles:
+
+| Profile | Typical use | Tracker |
+|---|---|---|
+| Fast Mode | Best realtime smoothness | ByteTrack custom |
+| RTX 3050 Balanced | Balance between stability and quality | BoT-SORT custom |
+| Quality Mode | Higher pose resolution, slower | BoT-SORT custom |
+
+In recent testing, Fast Mode with TensorRT pose backend has been the most practical realtime configuration.
+
+---
+
+## 5. Action Recognition Model
+
+| Property | Current value |
+|---|---|
+| Active backend | PyTorch / torch |
+| Active architecture | Bi-GRU + Multi-Head Self-Attention |
+| Active artifact | `runs/train_bigru_prod5_best_v1/final_safe_system.pth` |
+| Runtime selector | `runs/active_action_model_path.txt` |
+| Input shape | `(N, 128, 69)` |
+| Number of classes | 5 |
+| Training script | `train_professional_v3.py` |
+
+Model architecture:
+
+- Input LayerNorm.
+- Linear projection from 69 features to hidden dimension.
+- 3-layer bidirectional GRU.
+- Multi-Head Self-Attention pooling.
+- MLP classifier for 5 action classes.
+
+Training loss and optimization:
+
+- Focal Loss with gamma = 2.0.
+- Class weights for imbalanced classes.
+- AdamW optimizer.
+- CosineAnnealingWarmRestarts learning rate scheduler.
+- Early stopping.
+- Gradient clipping.
+- CUDA mixed precision when available.
+
+---
+
+## 6. Active Training Dataset
+
+Active training dataset:
+
+```text
+config/data/train_ready_bigru_prod5_best_v1
+```
+
+Dataset summary:
+
+| Item | Value |
+|---|---:|
+| Samples | 5,636 |
+| Sequence length | 128 frames |
+| Feature dimension | 69 |
+| Classes | 5 |
+
+Class distribution:
+
+| Class | Samples |
+|---|---:|
+| Fall | 1,665 |
+| Standing | 476 |
+| Walking | 1,720 |
+| Sitting | 1,012 |
+| Lying_Down | 763 |
+
+Data sources:
+
+| Source | Samples |
+|---|---:|
+| UR_Fall | 2,714 |
+| Multicam | 1,048 |
+| Augment_Fall | 504 |
+| Multicam_AllCams | 451 |
+| GMDCSA24 | 403 |
+| Unicomfacauca | 339 |
+| NTU_pseudo | 177 |
+
+The dataset is stored as processed pose sequences, not raw RGB video. Raw datasets and train-ready arrays are excluded from the lightweight submission ZIP because they are large.
+
+---
+
+## 7. Training Command
+
+Train the active Bi-GRU model:
+
+```bash
+python train_professional_v3.py \
+  --data_dir config/data/train_ready_bigru_prod5_best_v1 \
+  --save_dir runs/train_bigru_prod5_best_v1
+```
+
+Default training configuration:
+
+| Parameter | Value |
+|---|---:|
+| Optimizer | AdamW |
+| Learning rate | 8e-4 |
+| Batch size | 64 |
+| Max epochs | 300 |
+| Early stopping patience | 15 |
+| Dropout | 0.4 |
+| Weight decay | 2e-4 |
+| Validation split | 15% |
+
+Best recorded validation result on the active dataset:
+
+| Metric | Value |
+|---|---:|
+| Accuracy | 96.10% |
+| Weighted F1 | 96.11% |
+| Macro F1 | 96.09% |
+
+---
+
+## 8. TensorRT / PyTorch Pose Backend
+
+Pose model files:
+
+| File | Purpose |
+|---|---|
+| `yolov8n-pose.pt` | PyTorch YOLOv8 pose fallback |
+| `yolov8n-pose.engine` | Optional TensorRT acceleration artifact |
+| `yolov8n-pose.onnx` | Optional export intermediate |
+
+TensorRT export command:
+
+```bash
 source .trt-export-venv/bin/activate
 python export_pose_engine.py
-
-# Rebuild the clean 5-class focus dataset
-source .venv/bin/activate
-python repair_action_dataset.py \
-  --mode five_action_round4 \
-  --base_dir data/train_ready_action_repair_v2_unicomfacauca \
-  --sit_external_dir data/train_ready_action_repair_v4_sit_only \
-  --out_dir data/train_ready_action_repair_v6_five_action_round4
-
-# Add focused hard-case walking augmentations for the 5-class task
-python prepare_action_hardcases_round2.py \
-  --base_dir data/train_ready_action_repair_v6_five_action_round4 \
-  --out_dir data/train_ready_action_repair_v6_five_action_round4_hardcases \
-  --walk_partial_body_copies 120 \
-  --bending_boundary_copies 0
-
-# Retrain the current active ExtraTrees artifact
-python train_extratrees_action.py \
-  --data_dir data/train_ready_action_repair_v6_five_action_round4_hardcases \
-  --out_dir runs/train_extratrees_action_repair_v6_five_action_round4_hardcases_v1spec \
-  --feature_spec mean,std,min,max,first,last,delta,q25,q75,abs_vel_mean,vel_std
-
-# Run full pipeline (action recognition) on a video
-python main.py --video data/video/video1.mp4
-
-# Specify output directory
-python main.py --video data/video/video1.mp4 --out runs/action/my_run
-
-# Tracking only (no action recognition)
-python main.py --video data/video/video1.mp4 --mode track --out runs/track/my_run
-
-# Use GPU
-python main.py --video data/video/video1.mp4 --device cuda
-
-# Show real-time preview
-python main.py --video data/video/video1.mp4 --preview
 ```
 
-**Outputs** (saved to `--out` directory):
-- `video_action.mp4` — annotated video with bounding boxes, skeleton, action labels
-- `actions.csv` — per-frame: `frame, track_id, action, confidence, x1, y1, x2, y2`
-- `summary.json` — run metadata
+Notes:
 
-## 2.1 Desktop UI
-
-`pyqt_app.py` is the local UI for this project.
-It is better suited for low-latency preview because frames are rendered directly in a Qt window instead of being pushed through browser updates.
-
-Current PyQt6 UI includes:
-- Upload video mode
-- Webcam mode
-- Live preview in a native desktop window
-- Action recognition toggle
-- Tracking/detection/runtime controls
-- Annotated output video saving for uploaded videos
-
-If `yolov8n-pose.engine` exists in the project root, the PyQt6 app auto-prefers it when the current Python environment has TensorRT available.
-If TensorRT is not available in the current environment, the app falls back to `yolov8n-pose.pt`.
+- TensorRT improves pose inference speed.
+- TensorRT does not directly improve action classification accuracy.
+- Action accuracy still depends on pose quality, tracking ID stability, sequence quality, and action model behavior.
 
 ---
 
-## 3. System Architecture
+## 9. Useful Commands
 
-```
-Video Input
-    │
-    ▼
-[Module A]  src/module_a_detect.py
-    YOLOv8n — detection only (CSV/JSONL + annotated video)
-    │
-    ▼
-[Module B]  src/module_b_botsort_stable.py
-    YOLOv8n + BoT-SORT + Feature Memory Bank + Offline Merge
-    → tracks.csv, tracks_merged.csv, video_track.mp4
-    │
-    ▼
-[Module C]  src/module_c_action.py           ← main pipeline
-    YOLOv8n-Pose + BoT-SORT + Action Recognition
-    → actions.csv, video_action.mp4
-```
+Check active action model:
 
-`main.py` is the unified entry point that delegates to Module B or Module C based on `--mode`.
-
----
-
-## 4. Action Recognition Model
-
-| Property | Value |
-|----------|-------|
-| Active runtime model | ExtraTrees on 128x69 pose-sequence features |
-| Active artifact | `runs/train_extratrees_action_repair_v2_unicomfacauca_v1spec/extratrees_model.joblib` |
-| Runtime selector | `runs/active_action_model_path.txt` |
-| Input shape | (N, 128, 69) — 17 keypoints × 4 features + aspect ratio |
-| Internal classes | Fall / Standing / Walking / Sitting_Quickly / Bending / Lying_Down |
-| UI display classes | Fall / Standing / Walking / Sitting / Lying_Down |
-| Legacy research model | Bi-GRU (3 layers, 128 hidden) + Multi-Head Self-Attention |
-| Legacy checkpoint | `runs/train_v3/final_safe_system.pth` |
-
-**Current active 5-class repair pipeline:**
 ```bash
-python repair_action_dataset.py \
-  --mode five_action_round4 \
-  --base_dir data/train_ready_action_repair_v2_unicomfacauca \
-  --sit_external_dir data/train_ready_action_repair_v4_sit_only \
-  --out_dir data/train_ready_action_repair_v6_five_action_round4
-
-python prepare_action_hardcases_round2.py \
-  --base_dir data/train_ready_action_repair_v6_five_action_round4 \
-  --out_dir data/train_ready_action_repair_v6_five_action_round4_hardcases \
-  --walk_partial_body_copies 120 \
-  --bending_boundary_copies 0
-
-python train_extratrees_action.py \
-  --data_dir data/train_ready_action_repair_v6_five_action_round4_hardcases \
-  --out_dir runs/train_extratrees_action_repair_v6_five_action_round4_hardcases_v1spec \
-  --feature_spec mean,std,min,max,first,last,delta,q25,q75,abs_vel_mean,vel_std
+cat runs/active_action_model_path.txt
 ```
 
-The current active artifact is selected through `runs/active_action_model_path.txt`, so the PyQt6 app and runtime helpers can move to a better ExtraTrees artifact without hard-coding a single training directory. The desktop runtime currently aliases `Sitting_Quickly -> Sitting` for display and suppresses direct `Bending` display so ambiguous poses are less likely to be forced into the wrong visible action.
+Run headless profile benchmark:
 
-**Alternative 5-class experiment kept for reference:**
-- `runs/train_extratrees_action_repair_v6_five_action_round4_hardcases_v1spec/extratrees_model.joblib`
-- grouped-CV macro-F1: `0.7929`
-- useful for offline comparison, but the runtime was moved back to the 6-class internal artifact for better real-video ambiguity handling
-
-**Experimental taxonomy round 3 (not active):**
 ```bash
-python repair_action_dataset.py \
-  --mode taxonomy_round3 \
-  --base_dir data/train_ready_action_repair_v2_unicomfacauca \
-  --sit_external_dir data/train_ready_action_repair_v4_sit_only \
-  --out_dir data/train_ready_action_repair_v5_taxonomy_round3
-
-python train_extratrees_action.py \
-  --data_dir data/train_ready_action_repair_v5_taxonomy_round3 \
-  --out_dir runs/train_extratrees_action_repair_v5_taxonomy_round3_v3physics \
-  --feature_spec v3_physics_pose_stats
+source .trt-export-venv/bin/activate
+python run_headless_profile_benchmark.py \
+  --video "VideoTest/Human Fall Detection Sample.mp4" \
+  --profiles fast,balanced,quality
 ```
 
-This round introduced `Sitting` as a seventh class and improved some seated-static holdout slices, but it did not beat the now-active 5-class focus artifact on grouped validation, so it remains a non-promoted experiment.
+Run classic CLI pipeline on a video:
 
-**Optional hardcase round-2 experiment:**
 ```bash
-python prepare_action_hardcases_round2.py
-python train_extratrees_action.py \
-  --data_dir data/train_ready_action_repair_v3_hardcases \
-  --out_dir runs/train_extratrees_action_repair_v3_hardcases_v1spec \
-  --feature_spec mean,std,min,max,first,last,delta,q25,q75,abs_vel_mean,vel_std
+python main.py --video data/video/video1.mp4 --out runs/action/demo --device cuda
 ```
 
-This experiment is currently kept as a non-active candidate because it improved synthetic hardcases but remained below the promoted 5-class runtime artifact.
+Run tracking only:
 
-**Legacy deep-model training pipeline:**
 ```bash
-python extract_pose.py                 # Extract keypoints from UR_Fall + Multicam
-python data_prepare_v3.py             # Build training data (128 frames, 69 features)
-python train_professional_v3.py       # Train Bi-GRU model → runs/train_v3/
+python main.py --video data/video/video1.mp4 --mode track --out runs/track/demo
 ```
 
 ---
 
-## 5. Computational Constraints
+## 10. Repository Structure
 
-Designed for laptop-class hardware without GPU:
-
-| Constraint | Value |
-|------------|-------|
-| Hardware | CPU-only (no CUDA required) |
-| Detection model | YOLOv8n (lightweight) |
-| Inference speed | ~5–7 f/s on CPU (640px), ~3–4 f/s (1080p+) |
-| Max tracked persons | 50 (configurable via `--max_det`) |
-| Action warmup | 80 frames per track before first prediction |
-
----
-
-## 6. Module Reference
-
-Run individual modules directly:
-
-```bash
-# Module A — detection only
-python src/module_a_detect.py --video data/video/input.mp4 --out runs/detect/run1
-
-# Module B — tracking only (BoT-SORT + Memory Bank)
-python src/module_b_botsort_stable.py --video data/video/input.mp4 --out runs/track/run1
-
-# Module C — pose + action recognition
-python src/module_c_action.py --video data/video/input.mp4 --out runs/action/run1 \
-    --model_path runs/train_extratrees_action_repair_v6_five_action_round4_hardcases_v1spec/extratrees_model.joblib
-```
+| Path | Purpose |
+|---|---|
+| `pyqt_app.py` | Main PyQt6 desktop UI |
+| `src/runtime_shared.py` | Shared runtime recognizer, tracker/action helpers, postprocess logic |
+| `src/module_a_detect.py` | Detection-only module |
+| `src/module_b_track.py` | Tracking module |
+| `src/module_b_botsort.py` | BoT-SORT tracking implementation |
+| `src/module_c_action.py` | CLI pose + action module |
+| `train_professional_v3.py` | Bi-GRU action model training script |
+| `train_extratrees_action.py` | ExtraTrees baseline training script |
+| `export_pose_engine.py` | Optional TensorRT export script |
+| `config/` | Tracker and runtime YAML configs |
+| `runs/active_action_model_path.txt` | Selects active action model |
+| `runs/train_bigru_prod5_best_v1/` | Active Bi-GRU model artifact and training outputs |
+| `PROJECT_PRESENTATION_REPORT.md` | Detailed project report for presentation |
+| `TEST_GUIDELINES.md` | Local testing instructions |
 
 ---
 
-## 7. Dataset
+## 11. Submission ZIP Notes
 
-- **UR Fall Detection Dataset** (`data/UR_Fall/`) — image sequences, multiple ADL/fall scenarios
-- **Multicam Dataset** (`data/Multicam/`) — video clips with fall/non-fall annotations
-- **Unicomfacauca Dataset Modification** (`data/external/unicomfacauca/extracted/Fall-Detection-Dataset-Modification/`) — targeted external supplement now ingested conservatively for `Standing`, `Walking`, and `Lying_Down`
-- Processed keypoints: `data/processed_pose/*.npy` (shape: `(num_frames, 17, 2)`)
-- Training-ready: `data/train_ready_horizontal/` (shape: `(N, 128, 69)`)
-- Previous repaired 6-class train-ready dataset: `data/train_ready_action_repair_v2_unicomfacauca/`
-- Active focused 5-class train-ready dataset: `data/train_ready_action_repair_v6_five_action_round4_hardcases/`
+The lightweight submission package should include:
+
+- Source code.
+- `requirements.txt`.
+- `README.md`.
+- `TEST_GUIDELINES.md`.
+- `PROJECT_PRESENTATION_REPORT.md`.
+- `yolov8n-pose.pt`.
+- `runs/train_bigru_prod5_best_v1/final_safe_system.pth`.
+- Training plots such as `confusion_matrix.png` and `training_curves.png` if available.
+- Slide file, if included by the student.
+
+The package should exclude:
+
+- Virtual environments: `.venv/`, `venv/`, `.trt-export-venv/`.
+- Raw datasets and train-ready arrays under `config/data/`.
+- Runtime outputs under `runs/qt_outputs/`.
+- Cache/build folders: `.pip-cache/`, `.tmp-build/`, `__pycache__/`.
+- Large demo videos if a small submission is required.
+- Optional generated artifacts such as `.onnx` or `.engine` if size is limited.
+
+These excluded artifacts are reproducible or too large for submission. The final action model and source code are included.
 
 ---
 
-## 8. Reproducibility
+## 12. Known Limitations
 
-```bash
-pip install -r requirements.txt
-python main.py --video data/video/video1.mp4 --out runs/action/demo --device cpu
-```
+- Validation accuracy is high, but real videos can still fail because of pose missing, occlusion, fast scene cuts, and domain shift.
+- Sitting, Standing, and Lying_Down can be confused when legs are occluded or the person is partially outside the frame.
+- TensorRT improves FPS, but classification errors must be handled through better data, model training, and runtime state logic.
+- Raw training datasets are not included in the lightweight submission ZIP because of size.
 
-The system produces deterministic results on CPU. All components are modular and independently runnable.
+---
+
+## 13. Short Project Description
+
+This project builds an end-to-end human action recognition system using YOLOv8 pose estimation, multi-person tracking, and a temporal Bi-GRU action model. The system runs in a PyQt6 desktop application and supports optional TensorRT acceleration on NVIDIA GPUs. The current active model recognizes five actions: Fall, Standing, Walking, Sitting, and Lying_Down.
